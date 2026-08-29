@@ -1,0 +1,23 @@
+[package]
+name = "otip-app"
+version = "0.1.0"
+edition = "2021"
+description = "Otip video player binary"
+
+[dependencies]
+otip-core = { path = "../otip-core" }
+otip-video = { path = "../otip-video", features = ["mpv"] }
+mpv = { workspace = true }
+iced = { workspace = true }
+tokio = { workspace = true, features = ["full", "macros", "sync", "time", "fs", "rt-multi-thread"] }
+tracing = { workspace = true, features = ["std", "log"] }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+rfd = { workspace = true }
+dirs = { workspace = true }
+walkdir = { workspace = true }
+image = { workspace = true }
+
+[[bin]]
+name = "otip"
+path = "src/main.rs"

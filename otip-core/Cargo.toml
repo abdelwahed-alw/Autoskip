@@ -1,0 +1,33 @@
+[package]
+name = "otip-core"
+version = "0.1.0"
+edition = "2021"
+description = "Core domain types and shared logic for Otip video player"
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+serde_bytes = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true, features = ["serde", "clock"] }
+uuid = { workspace = true, features = ["v4", "serde", "fast-rng"] }
+bytes = { workspace = true }
+parking_lot = { workspace = true }
+dashmap = { workspace = true }
+crossbeam = { workspace = true }
+once_cell = { workspace = true }
+euclid = { workspace = true }
+tokio = { workspace = true, features = ["full", "sync", "time", "macros"] }
+async-trait = { workspace = true }
+reqwest = { workspace = true }
+tracing = { workspace = true, features = ["std"] }
+image = { workspace = true, features = ["png", "jpeg"] }
+base64 = { workspace = true }
+directories = { workspace = true }
+toml = { workspace = true }
+config = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+rstest = { workspace = true }
