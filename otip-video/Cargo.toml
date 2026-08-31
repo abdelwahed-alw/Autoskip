@@ -2,7 +2,7 @@
 name = "otip-video"
 version = "0.1.0"
 edition = "2021"
-description = "Video engine abstraction with mpv and GStreamer backends"
+description = "Video engine abstraction with GStreamer backend"
 
 [dependencies]
 otip-core = { path = "../otip-core" }
@@ -13,15 +13,13 @@ thiserror = { workspace = true }
 tracing = { workspace = true, features = ["std"] }
 parking_lot = { workspace = true }
 crossbeam = { workspace = true }
+crossbeam-channel = { workspace = true }
 uuid = { workspace = true, features = ["v4", "fast-rng"] }
 image = { workspace = true, features = ["png", "jpeg"] }
 bytes = { workspace = true }
 chrono = { workspace = true, features = ["serde", "clock"] }
 
-# MPV backend
-mpv = { workspace = true, optional = true }
-
-# GStreamer backend
+# GStreamer backend (AppSink for frame extraction)
 gstreamer = { workspace = true, optional = true }
 gstreamer-video = { workspace = true, optional = true }
 gstreamer-app = { workspace = true, optional = true }
@@ -29,11 +27,10 @@ gstreamer-gl = { workspace = true, optional = true }
 gstreamer-base = { workspace = true, optional = true }
 
 [features]
-default = ["mpv"]
-mpv = ["dep:mpv"]
+default = ["gstreamer"]
 gstreamer = ["dep:gstreamer", "dep:gstreamer-video", "dep:gstreamer-app", "dep:gstreamer-gl", "dep:gstreamer-base"]
 cuda = []
-vulkan = []
+vulcan = []
 
 [dev-dependencies]
 proptest = { workspace = true }

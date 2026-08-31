@@ -9,7 +9,7 @@
 //! 4. `mpsc::unbounded_channel` never blocks async runtime
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use iced::widget::image::Handle;
@@ -30,7 +30,11 @@ pub enum PlayerEvent {
 }
 
 /// Global handle for subscription polling (Subscription::run needs fn() -> Stream, no capture)
-pub static FRAME_RX_GLOBAL: OnceLock<Arc<Mutex<mpsc::UnboundedReceiver<PlayerEvent>>>> = OnceLock::new();
+/// Fixed: was `OnceLock` which could only be set once — second `VideoSelected` never updated
+/// the subscription, so new video frames were sent to a channel the UI never polled.
+/// Now `LazyLock<Mutex<Option<...>>>` allows replacement on each `spawn`.
+pub static FRAME_RX_GLOBAL: LazyLock<std::sync::Mutex<Option<Arc<Mutex<mpsc::UnboundedReceiver<PlayerEvent>>>>>> =
+    LazyLock::new(|| std::sync::Mutex::new(None));
 
 /// Handle to the background MPV task. Cheap to clone for UI.
 #[derive(Debug, Clone)]
@@ -44,6 +48,7 @@ impl VideoPlayerHandle {
     pub fn spawn(path: PathBuf) -> Self {
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<PlayerCmd>();
         let (evt_tx, evt_rx) = mpsc::unbounded_channel::<PlayerEvent>();
+        let path_for_global = path.clone();
 
         // ── Background Thread ──────────────────────────────────────────
         // spawn_blocking so mpv's blocking wait_event never stalls UI
@@ -185,7 +190,11 @@ impl VideoPlayerHandle {
         });
 
         let rx_arc = Arc::new(Mutex::new(evt_rx));
-        let _ = FRAME_RX_GLOBAL.set(rx_arc.clone());
+        {
+            let mut global = FRAME_RX_GLOBAL.lock().unwrap();
+            *global = Some(rx_arc.clone());
+            info!("FRAME_RX_GLOBAL updated for {:?}", path_for_global);
+        }
         Self {
             cmd_tx,
             event_rx: rx_arc,

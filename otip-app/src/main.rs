@@ -183,6 +183,7 @@ impl OtipApp {
                 Task::none()
             }
             Message::FrameReady(handle) => {
+                tracing::info!("UI FrameReady received -> rendering");
                 self.video_handle = Some(handle);
                 // Update timeline pos from frame progress if needed
                 Task::none()
@@ -399,18 +400,37 @@ fn theme(_: &OtipApp) -> Theme { Theme::Dark }
 fn title(app: &OtipApp) -> String { app.title() }
 fn subscription(_app: &OtipApp) -> iced::Subscription<Message> {
     iced::Subscription::run(|| {
-        iced::stream::channel::<Message>(4, move |mut out: iced::futures::channel::mpsc::Sender<Message>| async move {
+        iced::stream::channel::<Message>(16, move |mut out: iced::futures::channel::mpsc::Sender<Message>| async move {
             loop {
-                let frame = video_player::FRAME_RX_GLOBAL.get().and_then(|rx| {
-                    let mut guard = rx.lock().unwrap();
-                    let mut next = None;
-                    while let Ok(ev) = guard.try_recv() {
-                        if let PlayerEvent::Frame(h) = ev { next = Some(h); break; }
+                // Poll the *current* global receiver (now Mutex<Option<>> so it updates per video).
+                // Drain all pending events and keep the *latest* Frame to avoid lag.
+                let frame: Option<Handle> = {
+                    let global = video_player::FRAME_RX_GLOBAL.lock().unwrap();
+                    if let Some(rx_arc) = global.as_ref() {
+                        // rx_arc: Arc<std::sync::Mutex<UnboundedReceiver<PlayerEvent>>>
+                        let mut guard = rx_arc.lock().unwrap();
+                        let mut latest: Option<Handle> = None;
+                        while let Ok(ev) = guard.try_recv() {
+                            match ev {
+                                PlayerEvent::Frame(h) => {
+                                    latest = Some(h);
+                                }
+                                PlayerEvent::Error(e) => {
+                                    tracing::warn!("PlayerEvent::Error discarded in subscription: {}", e);
+                                }
+                                PlayerEvent::Ready { .. } => {}
+                            }
+                        }
+                        latest
+                    } else {
+                        None
                     }
-                    next
-                });
+                };
                 if let Some(h) = frame {
-                    let _ = out.send(Message::FrameReady(h)).await;
+                    tracing::info!("Subscription forwarding FrameReady to UI");
+                    if out.send(Message::FrameReady(h)).await.is_err() {
+                        break;
+                    }
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(16)).await;
             }
