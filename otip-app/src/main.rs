@@ -347,20 +347,48 @@ impl OtipApp {
             container(overlay).width(Length::Fill).height(Length::Fill).align_x(Alignment::End).align_y(Alignment::Start).padding(12),
         ].width(Length::Fill).height(Length::FillPortion(1));
 
+        // ── Modern semi-transparent bottom control bar (container + row) ──
+        // Play/Pause Toggle changes label based on PlaybackState
+        let playback_state = if self.is_playing { PlaybackState::Playing } else { PlaybackState::Paused };
+        let play_pause_label = match playback_state {
+            PlaybackState::Playing => "⏸ Pause",
+            PlaybackState::Paused => "▶ Play",
+            _ => "▶ Play",
+        };
+        let time_text = format!("{} / {}", format_duration_short(self.position), format_duration_short(self.duration));
+
+        let controls_row = row![
+            // Skip backward 10s
+            button(text("⏪ 10s").size(11)).on_press(Message::SkipBackward).padding([6,10])
+                .style(|_: &Theme, _| button::Style{ background: Some(Background::Color(Color::from_rgba(0.3,0.3,0.35,0.9))), border: Border{ radius:6.0.into(), ..Default::default()}, text_color: Color::WHITE, shadow: Shadow::default(), snap:false }),
+            // Play/Pause Toggle (changes label based on PlaybackState / is_playing)
+            button(text(play_pause_label).size(13).color(Color::WHITE))
+                .on_press(Message::PlayPause).padding([8,16])
+                .style(|_: &Theme, _| button::Style{ background: Some(Background::Color(Color::from_rgb(0.2,0.6,0.9))), border: Border{ radius:20.0.into(), ..Default::default()}, text_color: Color::WHITE, shadow: Shadow::default(), snap:false }),
+            // Skip forward 10s
+            button(text("10s ⏩").size(11)).on_press(Message::SkipForward).padding([6,10])
+                .style(|_: &Theme, _| button::Style{ background: Some(Background::Color(Color::from_rgba(0.3,0.3,0.35,0.9))), border: Border{ radius:6.0.into(), ..Default::default()}, text_color: Color::WHITE, shadow: Shadow::default(), snap:false }),
+            // Time Elapsed / Total Duration
+            text(time_text).size(12).color(Color::from_rgb(0.9,0.9,0.95)),
+            // Volume label + small slider
+            text("🔊").size(12).color(Color::from_rgb(0.7,0.7,0.75)),
+            slider(0.0..=1.0, self.volume, Message::VolumeChanged).step(0.01).width(Length::Fixed(90.0)),
+            button(text("← Library").size(11)).on_press(Message::NavigateTo(AppScreen::Library)).padding([6,10])
+                .style(|t: &Theme, _| button::Style{ background: Some(Background::Color(Color::from_rgba(0.15,0.15,0.18,1.0))), border: Border{ color: Color::from_rgb(0.3,0.3,0.35), width:1.0, radius:6.0.into()}, text_color: t.palette().text, shadow: Shadow::default(), snap:false }),
+        ].align_y(Alignment::Center).spacing(10).width(Length::Fill);
+
+        let seek_bar = slider(0.0..=1.0, self.timeline_pos, Message::Seek).step(0.01).width(Length::Fill);
+
         let bottom_bar = container(column![
-            slider(0.0..=1.0, self.timeline_pos, Message::Seek).step(0.01).width(Length::Fill),
-            row![
-                button(text("← Back to Library").size(12)).on_press(Message::NavigateTo(AppScreen::Library)).padding([6,10])
-                    .style(|t: &Theme, _| button::Style{ background: Some(Background::Color(Color::from_rgba(0.15,0.15,0.18,1.0))), border: Border{ color: Color::from_rgb(0.3,0.3,0.35), width:1.0, radius:6.0.into()}, text_color: t.palette().text, shadow: Shadow::default(), snap:false }),
-                Space::new().width(Length::Fill),
-                button(text(if self.is_playing { "⏸ Pause" } else { "▶ Play" }).size(13).color(Color::WHITE))
-                    .on_press(Message::PlayPause).padding([8,16])
-                    .style(|_: &Theme, _| button::Style{ background: Some(Background::Color(Color::from_rgb(0.2,0.6,0.9))), border: Border{ radius:20.0.into(), ..Default::default()}, text_color: Color::WHITE, shadow: Shadow::default(), snap:false }),
-                Space::new().width(Length::Fill),
-                text(format!("{:.0}%", self.timeline_pos * 100.0)).size(11).color(Color::from_rgb(0.6,0.6,0.65)),
-            ].align_y(Alignment::Center).spacing(12).width(Length::Fill),
-        ].spacing(8)).width(Length::Fill).padding([10,12])
-            .style(|t: &Theme| container::Style{ background: Some(Background::Color(Color::from_rgb(0.12,0.12,0.15))), border: Border{ color: Color::from_rgb(0.22,0.22,0.26), width:1.0, radius:8.0.into()}, shadow: Shadow::default(), text_color: Some(t.palette().text), snap:false });
+            seek_bar,
+            Space::new().height(Length::Fixed(6.0)),
+            controls_row,
+        ].spacing(6)).width(Length::Fill).padding([12,14])
+            .style(|_: &Theme| container::Style{
+                background: Some(Background::Color(Color::from_rgba(0.08,0.08,0.10,0.92))),
+                border: Border{ color: Color::from_rgba(1.0,1.0,1.0,0.08), width:1.0, radius:8.0.into()},
+                shadow: Shadow::default(), text_color: Some(Color::from_rgb(0.9,0.9,0.95)), snap:false
+            });
 
         column![stacked, bottom_bar].spacing(0).width(Length::Fill).height(Length::Fill).into()
     }

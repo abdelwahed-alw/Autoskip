@@ -162,60 +162,32 @@ impl VideoPlayerHandle {
                         tokio::time::sleep(Duration::from_millis(50)).await;
                         continue;
                     }
-
-                    // ── Real frame extraction ────────────────────────
-                    // Hook into mpv's actual frame buffer. Two viable paths:
-                    // 1) RenderContext / opengl-cb: MpvHandlerWithGl::draw(fbo, w, h) + glReadPixels → RGBA
-                    //    Requires vo=libmpv or vo=gpu + hwdec=no (see above)
-                    //    Example:
-                    //      gl_ctx.draw(0, w as i32, h as i32)?;
-                    //      unsafe { gl::ReadPixels(0,0,w,h, gl::RGBA, gl::UNSIGNED_BYTE, buf.as_mut_ptr() as *mut _) }
-                    // 2) vo=image + hwdec=no: screenshot-raw BGRA → RGBA
-                    //    Example:
-                    //      mpv.command(&["screenshot-raw", "video"])?;
-                    //      let bgra = ...; let rgba = bgra_to_rgba(bgra);
-                    // Below uses grab_mpv_frame which currently implements the screenshot-raw
-                    // placeholder tied to time-pos, but the vo/hwdec options above guarantee
-                    // that when libmpv is present frames are on CPU and readable.
-                    let frame: Option<(u32, u32, Vec<u8>)> = if let Some(m) = mpv.as_mut() {
-                        grab_mpv_frame(m)
-                    } else {
-                        // CI fallback: generate dummy moving bar so UI still proves channel works
-                        // when libmpv.so is absent. This path keeps cargo check green.
-                        let t = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis() as f64;
-                        let luma = ((t / 100.0).sin() * 20.0 + 128.0) as u8;
-                        let (w, h) = (640, 360);
-                        let mut buf = vec![0u8; (w * h * 4) as usize];
-                        for px in buf.chunks_exact_mut(4) {
-                            px[0] = luma.saturating_add(10);
-                            px[1] = luma;
-                            px[2] = 255 - luma;
-                            px[3] = 0xFF;
-                        }
-                        Some((w, h, buf))
-                    };
-
-                    if let Some((w, h, rgba)) = frame {
-                        // Requirement #3: mandatory log proving frames are grabbed
-                        info!("Extracted frame {}x{}", w, h);
-                        let handle = Handle::from_rgba(w, h, rgba);
-                        // Unbounded send never blocks; if UI dropped, exit loop
-                        if evt_tx.send(PlayerEvent::Frame(handle)).is_err() {
-                            break;
-                        }
-                    } else {
-                        // No frame yet (mpv still loading) — keep UI responsive, don't spam errors
-                        // Previously this sent PlayerEvent::Error("no frame") every tick which
-                        // flooded the channel; now we just sleep and retry.
+                    // periodic position polling and forwarding
+                    if let (Some(pos), Some(dur)) = (
+                        pipeline_clone.query_position::<gst::ClockTime>(),
+                        pipeline_clone.query_duration::<gst::ClockTime>(),
+                    ) {
+                        let position = Duration::from_nanos(pos.nseconds());
+                        let duration = Duration::from_nanos(dur.nseconds());
+                        let _ = evt_tx_for_cmd.send(PlayerEvent::PositionUpdate { position, duration });
                     }
-
-                    tokio::time::sleep(Duration::from_millis(33)).await; // ~30fps, yields to runtime
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                 }
-                warn!("MPV thread exited");
+                warn!("GStreamer thread exited");
             });
+        });
+
+        // Frame forwarding task - convert GStreamer buffers to iced Handles
+        tokio::spawn(async move {
+            while let Some((data, width, height)) = frame_rx.recv().await {
+                if data.len() >= (width * height * 4) as usize {
+                    let handle = Handle::from_rgba(width, height, data);
+                    info!("Extracted frame {}x{}", width, height);
+                    if evt_tx_for_frames.send(PlayerEvent::Frame(handle)).is_err() {
+                        break;
+                    }
+                }
+            }
         });
 
         let rx_arc = Arc::new(Mutex::new(evt_rx));
