@@ -45,12 +45,16 @@ pub struct OtipApp {
     screen: AppScreen,
     library_folder: Option<PathBuf>,
     library_videos: Vec<PathBuf>,
+    thumbnails: HashMap<PathBuf, Handle>, // in-memory cache + temp file fallback
     selected_video_path: Option<PathBuf>,
     playback_mode: PlaybackMode,
     is_playing: bool,
+    position: Duration,
+    duration: Duration,
+    volume: f32, // 0.0..1.0
     timeline_pos: f32,
     status: String,
-    // ── MPV integration ──
+    // ── GStreamer playbin integration ──
     video_player: Option<VideoPlayerHandle>,
     video_handle: Option<Handle>, // last frame for iced::widget::Image
 }
@@ -62,9 +66,13 @@ impl OtipApp {
                 screen: AppScreen::Splash,
                 library_folder: None,
                 library_videos: Vec::new(),
+                thumbnails: HashMap::new(),
                 selected_video_path: None,
                 playback_mode: PlaybackMode::SafeMode,
                 is_playing: false,
+                position: Duration::ZERO,
+                duration: Duration::ZERO,
+                volume: 0.7,
                 timeline_pos: 0.0,
                 status: "Welcome to Otip".into(),
                 video_player: None,
@@ -98,12 +106,26 @@ impl OtipApp {
                 Task::none()
             }
             Message::LibraryScanned(videos) => {
-                self.library_videos = videos;
+                // 3. State Update: persist videos and trigger UI refresh immediately
+                self.library_videos = videos.clone();
                 self.status = if self.library_videos.is_empty() {
                     "No videos found in Videos/Downloads — use Select Folder".into()
                 } else {
                     format!("Auto-discovered {} videos", self.library_videos.len())
                 };
+                tracing::info!("LibraryScanned: {} videos -> UI refresh", self.library_videos.len());
+                // 2. Async Thumbnails: render placeholders immediately, load each thumbnail async via per-video Tasks
+                if !videos.is_empty() {
+                    // Spawn one Task per video so UI shows 79 placeholders instantly and updates incrementally
+                    let tasks = videos.into_iter().map(|p| {
+                        let path = p.clone();
+                        Task::perform(
+                            video_player::extract_thumbnail_async(path.clone()),
+                            move |handle_opt| Message::ThumbnailReady(path.clone(), handle_opt),
+                        )
+                    });
+                    return Task::batch(tasks);
+                }
                 Task::none()
             }
             Message::SelectFolder => Task::perform(
@@ -135,7 +157,19 @@ impl OtipApp {
                                 .collect();
                             videos.sort();
                             self.status = format!("Found {} videos in {}", videos.len(), folder.display());
-                            self.library_videos = videos;
+                            // State Update: set videos first so grid renders placeholders instantly
+                            self.library_videos = videos.clone();
+                            tracing::info!("FolderSelected: {} videos -> UI refresh", self.library_videos.len());
+                            if !videos.is_empty() {
+                                let tasks = videos.into_iter().map(|p| {
+                                    let path = p.clone();
+                                    Task::perform(
+                                        video_player::extract_thumbnail_async(path.clone()),
+                                        move |handle_opt| Message::ThumbnailReady(path.clone(), handle_opt),
+                                    )
+                                });
+                                return Task::batch(tasks);
+                            }
                         }
                         Err(e) => {
                             self.status = format!("Failed to read folder: {}", e);
@@ -145,15 +179,31 @@ impl OtipApp {
                 }
                 Task::none()
             }
+            Message::ThumbnailsBatch(batch) => {
+                for (path, handle) in batch {
+                    self.thumbnails.insert(path, handle);
+                }
+                Task::none()
+            }
+            Message::ThumbnailReady(path, handle_opt) => {
+                if let Some(h) = handle_opt {
+                    self.thumbnails.insert(path, h);
+                }
+                Task::none()
+            }
             // ── Engine Initialization (background, non-blocking) ───────
             Message::VideoSelected(path) => {
                 self.selected_video_path = Some(path.clone());
-                self.playback_mode = self.playback_mode; // keep current
                 self.screen = AppScreen::Player;
                 self.is_playing = true;
+                self.position = Duration::ZERO;
+                self.duration = Duration::ZERO;
+                self.timeline_pos = 0.0;
                 self.video_handle = None;
-                // Spawn MPV in background thread; UI stays responsive
+                // Spawn playbin with appsink in background thread; UI stays responsive
                 let player = VideoPlayerHandle::spawn(path.clone());
+                // Apply current volume to new player
+                player.set_volume(self.volume);
                 self.video_player = Some(player);
                 self.status = format!("Loading: {}", path.display());
                 tracing::info!("VideoSelected {:?} with mode {} → Player", path, self.playback_mode);
@@ -249,6 +299,9 @@ impl OtipApp {
     }
 
     fn view_library(&self) -> Element<Message> {
+        // 1. Render Logic: iterate over library_videos and build grid immediately
+        // 2. Placeholders: show colored box + icon for every video so 79 videos render instantly
+        //    Thumbnails load async via Message::ThumbnailReady and replace placeholders incrementally
         let top_bar = row![
             button(text("← Back").size(13)).on_press(Message::NavigateTo(AppScreen::Splash)).padding(8)
                 .style(|t: &Theme, _| button::Style {
@@ -267,6 +320,8 @@ impl OtipApp {
                 }),
         ].align_y(Alignment::Center).spacing(12).width(Length::Fill);
         let status = text(&self.status).size(11).color(Color::from_rgb(0.5, 0.5, 0.55));
+
+        // Always iterate over library_videos; never hide grid when thumbnails are pending
         let grid: Element<Message> = if self.library_videos.is_empty() {
             container(column![
                 text("No videos found").size(16).color(Color::from_rgb(0.6, 0.6, 0.65)),
@@ -274,61 +329,164 @@ impl OtipApp {
                 text("Select a folder containing .mp4 / .mkv / .avi files").size(12).color(Color::from_rgb(0.5, 0.5, 0.5)),
             ].align_x(Alignment::Center)).width(Length::Fill).height(Length::Fill).center_x(Length::Fill).center_y(Length::Fill).into()
         } else {
-            let cards = self.library_videos.iter().map(|path| {
-                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("video").to_string();
-                let p = path.clone();
-                button(container(column![
-                    container(text("🎬").size(32)).width(Length::Fill).center_x(Length::Fill),
-                    text(name.clone()).size(12).color(Color::WHITE),
-                    text(p.extension().and_then(|e| e.to_str()).unwrap_or("").to_uppercase()).size(10).color(Color::from_rgb(0.6, 0.6, 0.65)),
-                ].spacing(6).align_x(Alignment::Center)).padding(12).width(Length::Fill))
-                .on_press(Message::VideoSelected(p)).padding(0).width(Length::FillPortion(1))
-                .style(|t: &Theme, s| button::Style {
-                    background: Some(Background::Color(match s {
-                        button::Status::Hovered => Color::from_rgb(0.22, 0.22, 0.28),
-                        _ => Color::from_rgb(0.16, 0.16, 0.2),
-                    })),
-                    border: Border { color: Color::from_rgb(0.28, 0.28, 0.32), width: 1.0, radius: 8.0.into() },
-                    text_color: t.palette().text, shadow: Shadow::default(), snap: false
-                }).into()
-            });
-            let mut rows: Vec<Element<Message>> = Vec::new();
-            let mut current_row: Vec<Element<Message>> = Vec::new();
-            for (i, card) in cards.enumerate() {
-                current_row.push(card);
-                if (i + 1) % 3 == 0 {
-                    rows.push(row(std::mem::take(&mut current_row)).spacing(12).width(Length::Fill).into());
-                }
-            }
-            if !current_row.is_empty() {
-                while current_row.len() < 3 { current_row.push(Space::new().width(Length::FillPortion(1)).into()); }
-                rows.push(row(current_row).spacing(12).width(Length::Fill).into());
-            }
-            scrollable(column(rows).spacing(12).padding(4)).width(Length::Fill).height(Length::Fill).into()
+            // Build card for every discovered video (79) - placeholder if thumbnail not yet ready
+            // Use chunks(3) to guarantee all videos appear in rows
+            let rows: Vec<Element<Message>> = self
+                .library_videos
+                .chunks(3)
+                .map(|chunk| {
+                    let row_cards: Vec<Element<Message>> = chunk
+                        .iter()
+                        .map(|path| {
+                            let name = path
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("video")
+                                .to_string();
+                            let p = path.clone();
+                            let ext = p
+                                .extension()
+                                .and_then(|e| e.to_str())
+                                .unwrap_or("")
+                                .to_uppercase();
+                            // 2. Async Thumbnails: immediate placeholder (colored box) or cached image via iced::widget::image
+                            let thumb: Element<Message> =
+                                if let Some(handle) = self.thumbnails.get(path) {
+                                    // Thumbnail ready - render via iced::widget::image Handle::from_rgba (GStreamer 5s frame)
+                                    container(
+                                        image(handle.clone())
+                                            .width(Length::Fill)
+                                            .height(Length::Fixed(90.0)),
+                                    )
+                                    .width(Length::Fill)
+                                    .height(Length::Fixed(90.0))
+                                    .style(|_: &Theme| container::Style {
+                                        background: Some(Background::Color(Color::from_rgb(
+                                            0.08, 0.08, 0.10,
+                                        ))),
+                                        border: Border {
+                                            color: Color::from_rgb(0.25, 0.25, 0.30),
+                                            width: 1.0,
+                                            radius: 6.0.into(),
+                                        },
+                                        shadow: Shadow::default(),
+                                        text_color: None,
+                                        snap: false,
+                                    })
+                                    .into()
+                                } else {
+                                    // Placeholder colored box - visible immediately for all 79 videos
+                                    container(
+                                        column![
+                                            text("🎬").size(32).color(Color::from_rgb(0.6, 0.6, 0.9)),
+                                            text("loading…").size(9).color(Color::from_rgb(0.5, 0.5, 0.55))
+                                        ]
+                                        .spacing(4)
+                                        .align_x(Alignment::Center),
+                                    )
+                                    .width(Length::Fill)
+                                    .height(Length::Fixed(90.0))
+                                    .center_x(Length::Fill)
+                                    .center_y(Length::Fill)
+                                    .style(|_: &Theme| container::Style {
+                                        background: Some(Background::Color(Color::from_rgb(
+                                            0.14, 0.14, 0.18,
+                                        ))),
+                                        border: Border {
+                                            color: Color::from_rgb(0.30, 0.30, 0.35),
+                                            width: 1.0,
+                                            radius: 6.0.into(),
+                                        },
+                                        shadow: Shadow::default(),
+                                        text_color: None,
+                                        snap: false,
+                                    })
+                                    .into()
+                                };
+                            button(
+                                container(
+                                    column![
+                                        thumb,
+                                        text(name.clone()).size(12).color(Color::WHITE),
+                                        text(ext.clone())
+                                            .size(10)
+                                            .color(Color::from_rgb(0.6, 0.6, 0.65)),
+                                    ]
+                                    .spacing(6)
+                                    .align_x(Alignment::Center),
+                                )
+                                .padding(10)
+                                .width(Length::Fill),
+                            )
+                            .on_press(Message::VideoSelected(p))
+                            .padding(0)
+                            .width(Length::FillPortion(1))
+                            .style(|t: &Theme, s| button::Style {
+                                background: Some(Background::Color(match s {
+                                    button::Status::Hovered => Color::from_rgb(0.22, 0.22, 0.28),
+                                    _ => Color::from_rgb(0.16, 0.16, 0.2),
+                                })),
+                                border: Border {
+                                    color: Color::from_rgb(0.28, 0.28, 0.32),
+                                    width: 1.0,
+                                    radius: 8.0.into(),
+                                },
+                                text_color: t.palette().text,
+                                shadow: Shadow::default(),
+                                snap: false,
+                            })
+                            .into()
+                        })
+                        .collect();
+                    // Pad last row with spacers so row fills width
+                    let mut row_elems = row_cards;
+                    while row_elems.len() < 3 {
+                        row_elems.push(Space::new().width(Length::FillPortion(1)).into());
+                    }
+                    row(row_elems).spacing(12).width(Length::Fill).into()
+                })
+                .collect();
+            scrollable(column(rows).spacing(12).padding(4))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
         };
-        container(column![top_bar, Space::new().height(Length::Fixed(12.0)), status, Space::new().height(Length::Fixed(8.0)), grid].spacing(4))
-            .width(Length::Fill).height(Length::Fill).padding(16)
-            .style(|t: &Theme| container::Style {
-                background: Some(Background::Color(t.palette().background)),
-                border: Border::default(), shadow: Shadow::default(), text_color: Some(t.palette().text), snap: false,
-            }).into()
+        container(
+            column![
+                top_bar,
+                Space::new().height(Length::Fixed(12.0)),
+                status,
+                Space::new().height(Length::Fixed(8.0)),
+                grid
+            ]
+            .spacing(4),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .padding(16)
+        .style(|t: &Theme| container::Style {
+            background: Some(Background::Color(t.palette().background)),
+            border: Border::default(),
+            shadow: Shadow::default(),
+            text_color: Some(t.palette().text),
+            snap: false,
+        })
+        .into()
     }
 
     fn view_player(&self) -> Element<Message> {
         // ── Video Rendering: iced::widget::image from raw RGBA ───────
-        // Frame extraction runs in video_player.rs:spawn_blocking → mpsc → Subscription → FrameReady(Handle)
         let video_area: Element<Message> = if let Some(handle) = &self.video_handle {
-            // Real video frame — Handle::from_rgba(w,h,rgba) created in background thread
             image(handle.clone()).width(Length::Fill).height(Length::Fill).into()
         } else {
             container(column![
-                text("▶ Initializing MPV…").size(18).color(Color::WHITE).align_x(Alignment::Center),
+                text("▶ Initializing GStreamer playbin…").size(18).color(Color::WHITE).align_x(Alignment::Center),
                 Space::new().height(Length::Fixed(8.0)),
                 text(self.selected_video_path.as_ref().and_then(|p| p.file_name()).and_then(|n| n.to_str()).unwrap_or("no file")).size(12).color(Color::from_rgb(0.7,0.7,0.75)),
                 Space::new().height(Length::Fixed(6.0)),
                 text(format!("[{}] {}", self.playback_mode, if self.is_playing { "Playing" } else { "Paused" })).size(11).color(Color::from_rgb(0.2,0.6,0.9)),
                 Space::new().height(Length::Fixed(8.0)),
-                text("mpv → spawn_blocking → Handle::from_rgba → Image").size(10).color(Color::from_rgb(0.5,0.5,0.55)),
+                text("playbin → appsink (sync=true) → Handle::from_rgba → Image").size(10).color(Color::from_rgb(0.5,0.5,0.55)),
             ].align_x(Alignment::Center).spacing(4))
             .width(Length::Fill).height(Length::Fill).center_x(Length::Fill).center_y(Length::Fill)
             .style(|_: &Theme| container::Style{ background: Some(Background::Color(Color::from_rgb(0.04,0.04,0.06))), border: Border{ color: Color::from_rgb(0.18,0.18,0.22), width:1.0, radius:8.0.into()}, shadow: Shadow::default(), text_color: None, snap:false }).into()

@@ -28,7 +28,7 @@ impl VideoDisplay {
         self.show_placeholder = false;
     }
     pub fn clear(&mut self) { self.current_frame = None; self.frame_bytes = None; self.frame_size=(0,0); self.show_placeholder=true; }
-    pub fn view(&mut self) -> Element<VideoDisplayMessage> {
+    pub fn view(&self) -> Element<VideoDisplayMessage> {
         let content = if self.show_placeholder {
             column![
                 text("🎬").size(64).color(Color::from_rgb(0.2,0.6,0.9)),

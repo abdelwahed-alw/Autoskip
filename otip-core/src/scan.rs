@@ -1,4 +1,5 @@
 //! Video scanning logic and grid processing
+//! Thumbnail extraction: single frame at 5-second mark via GStreamer, cached in memory / temp file, rendered via iced::widget::image
 
 use std::sync::Arc;
 use std::time::Duration;

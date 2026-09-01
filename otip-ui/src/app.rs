@@ -379,8 +379,7 @@ impl OtipApp {
     }
 
     fn player_screen_view(&self) -> Element<Message> {
-        let mut player = PlayerScreen::new();
-        player.view(&self.state)
+        self.player_screen.view(&self.state)
     }
 
     fn theme(&self) -> Theme {

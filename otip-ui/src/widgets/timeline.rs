@@ -17,7 +17,7 @@ impl TimelineWidget {
     pub fn new() -> Self { Self }
     pub fn clear_cache(&mut self) {}
     pub fn view<'a>(
-        &'a mut self,
+        &'a self,
         timeline: Option<&'a Timeline>,
         position: Duration,
         duration: Duration,

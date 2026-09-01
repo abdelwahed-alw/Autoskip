@@ -143,6 +143,20 @@ pub struct TimelineSegment {
     pub scan_segment: Option<ScanSegment>,
 }
 
+/// Video thumbnail data
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VideoThumbnail {
+    pub data: Vec<u8>,          // PNG encoded thumbnail
+    pub width: u32,
+    pub height: u32,
+}
+
+impl VideoThumbnail {
+    pub fn new(data: Vec<u8>, width: u32, height: u32) -> Self {
+        Self { data, width, height }
+    }
+}
+
 /// Video metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VideoMetadata {
@@ -157,6 +171,7 @@ pub struct VideoMetadata {
     pub has_audio: bool,
     pub created_at: DateTime<Utc>,
     pub last_played: Option<DateTime<Utc>>,
+    pub thumbnail: Option<VideoThumbnail>,
 }
 
 /// Scan progress information

@@ -56,6 +56,7 @@ pub fn otip_theme() -> IcedTheme {
             primary: OtipPalette::PRIMARY,
             success: OtipPalette::SUCCESS,
             danger: OtipPalette::ERROR,
+            warning: OtipPalette::WARNING,
         },
     )
 }
@@ -70,6 +71,7 @@ pub fn otip_light_theme() -> IcedTheme {
             primary: OtipPalette::PRIMARY,
             success: OtipPalette::SUCCESS,
             danger: OtipPalette::ERROR,
+            warning: OtipPalette::WARNING,
         },
     )
 }
