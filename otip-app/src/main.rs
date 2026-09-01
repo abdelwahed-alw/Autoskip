@@ -1,15 +1,18 @@
-//! Otip - Iced 0.14 with 3-screen routing + MPV video rendering
-//! Splash → Library (auto-scan) → Player (Image from mpv frames)
+//! Otip - Iced 0.14 with 3-screen routing + GStreamer playbin rendering
+//! Splash → Library (thumbnails) → Player (Image from playbin frames + controls)
 
 mod video_player;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Duration;
 use iced::{
     widget::{button, column, container, image, row, scrollable, slider, text, Space, stack},
     Alignment, Background, Border, Color, Element, Length, Shadow, Task, Theme,
 };
 use iced::widget::image::Handle;
-use otip_core::domain::PlaybackMode;
+use otip_core::domain::{PlaybackMode, PlaybackState};
+use otip_core::timeline::format_duration_short;
 use tracing_subscriber::EnvFilter;
 use video_player::{PlayerEvent, VideoPlayerHandle};
 use iced::futures::SinkExt;
@@ -158,7 +161,6 @@ impl OtipApp {
             }
             Message::FileSelected(opt) => {
                 if let Some(p) = opt {
-                    // Reuse VideoSelected path so mpv init is centralized
                     return self.update(Message::VideoSelected(p));
                 }
                 Task::none()
@@ -213,6 +215,10 @@ impl OtipApp {
                 text_color: Some(t.palette().text),
                 snap: false,
             })
+            .into();
+        column![title_bar, inner]
+            .width(Length::Fill)
+            .height(Length::Fill)
             .into()
     }
 
@@ -375,7 +381,7 @@ async fn scan_default_media_dirs() -> Vec<PathBuf> {
         if let Some(p) = dirs::download_dir() { roots.push(p); }
         if roots.is_empty() { if let Some(h) = dirs::home_dir() { roots.push(h); } }
         let mut videos = Vec::new();
-        const EXTS: &[&str] = &["mp4","mkv","avi"];
+        const EXTS: &[&str] = &["mp4","mkv","avi","mov","webm","flv","wmv","m4v","mpg","mpeg"];
         for root in &roots {
             if !root.exists() { continue; }
             for entry in walkdir::WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
@@ -440,7 +446,7 @@ fn subscription(_app: &OtipApp) -> iced::Subscription<Message> {
 
 fn main() -> iced::Result {
     tracing_subscriber::fmt().with_env_filter(EnvFilter::from_default_env().add_directive("otip=info".parse().unwrap())).with_target(false).init();
-    tracing::info!("Starting Otip — Splash → Library → Player (MPV → Image)");
+    tracing::info!("Starting Otip — Splash → Library (thumbnails at 5s) → Player (playbin + controls)");
     iced::application(boot, update, view).theme(theme).title(title).subscription(subscription)
         .window(iced::window::Settings{ size: iced::Size::new(1280.0, 720.0), min_size: Some(iced::Size::new(900.0,600.0)), ..Default::default() }).run()
 }

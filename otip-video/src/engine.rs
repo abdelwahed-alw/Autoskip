@@ -72,17 +72,17 @@ pub struct VideoEngineFactory;
 impl VideoEngineFactory {
     /// Create the best available engine
     pub fn create_best() -> Box<dyn VideoEngine> {
-        #[cfg(feature = "mpv")]
-        {
-            if MpvEngine::is_available() {
-                return Box::new(MpvEngine::new());
-            }
-        }
-        
         #[cfg(feature = "gstreamer")]
         {
             if GStreamerEngine::is_available() {
                 return Box::new(GStreamerEngine::new());
+            }
+        }
+        
+        #[cfg(feature = "mpv")]
+        {
+            if MpvEngine::is_available() {
+                return Box::new(MpvEngine::new());
             }
         }
         
@@ -138,27 +138,11 @@ impl Default for EngineConfig {
             preferred_hw_api: None,
             vo_driver: None,
             ao_driver: None,
-            frame_extraction_resolution: (320, 240),
+            frame_extraction_resolution: (320, 180),
             cache_duration: Duration::from_secs(10),
         }
     }
 }
-
-#[cfg(feature = "mpv")]
-pub mod mpv_engine {
-    use super::*;
-    use crate::mpv_backend::MpvEngine;
-
-    impl MpvEngine {
-        pub fn is_available() -> bool {
-            // MPV is usually available if the feature is enabled
-            true
-        }
-    }
-}
-
-#[cfg(feature = "mpv")]
-pub use crate::mpv_backend::MpvEngine;
 
 #[cfg(feature = "gstreamer")]
 pub mod gstreamer_engine {
@@ -167,11 +151,25 @@ pub mod gstreamer_engine {
 
     impl GStreamerEngine {
         pub fn is_available() -> bool {
-            // Check if GStreamer is available
             gstreamer::init().is_ok()
         }
     }
 }
 
 #[cfg(feature = "gstreamer")]
-pub use gstreamer_backend::GStreamerEngine;
+pub use crate::gstreamer_backend::GStreamerEngine;
+
+#[cfg(feature = "mpv")]
+pub mod mpv_engine {
+    use super::*;
+    use crate::mpv_backend::MpvEngine;
+
+    impl MpvEngine {
+        pub fn is_available() -> bool {
+            true
+        }
+    }
+}
+
+#[cfg(feature = "mpv")]
+pub use crate::mpv_backend::MpvEngine;

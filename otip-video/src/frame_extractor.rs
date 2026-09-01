@@ -32,7 +32,7 @@ impl MpvFrameExtractor {
 
     pub async fn start_extraction(
         &self,
-        video_id: VideoId,
+        _video_id: VideoId,
         duration: Duration,
         tx: mpsc::UnboundedSender<(Duration, DynamicImage)>,
     ) -> Result<()> {
@@ -61,7 +61,7 @@ impl MpvFrameExtractor {
         timestamp: Duration,
         _resolution: (u32, u32),
     ) -> Result<DynamicImage> {
-        let engine = engine.lock().await;
+        let mut engine = engine.lock().await;
         // This will be implemented by the GStreamer backend
         engine.request_frame(VideoId::new(), timestamp).await
     }

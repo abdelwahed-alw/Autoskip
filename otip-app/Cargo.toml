@@ -16,6 +16,10 @@ rfd = { workspace = true }
 dirs = { workspace = true }
 walkdir = { workspace = true }
 image = { workspace = true }
+gstreamer = { workspace = true }
+gstreamer-app = { workspace = true }
+gstreamer-video = { workspace = true }
+gstreamer-base = { workspace = true }
 
 [[bin]]
 name = "otip"

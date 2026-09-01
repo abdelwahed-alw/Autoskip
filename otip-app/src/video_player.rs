@@ -1,24 +1,26 @@
-//! Video engine wrapper for Iced 0.14 - MPV integration via background thread
-//! Architecture: UI thread (Iced) <-> mpsc channel <-> blocking mpv thread
+//! Video engine wrapper for Iced 0.14 - GStreamer AppSink integration
+//! Architecture: UI thread (Iced) <-> mpsc channel <-> GStreamer thread
 //! Rendering: raw RGBA -> iced::widget::image::Handle::from_rgba -> <Image>
-//!
-//! Fixed for:
-//! 1. Auto-Play: `set pause no` immediately after loadfile
-//! 2. RenderContext / `vo=image` + `hwdec=no` for CPU RGBA frames
-//! 3. `tracing::info!("Extracted frame {}x{}", w, h)` in loop
-//! 4. `mpsc::unbounded_channel` never blocks async runtime
+//! Thumbnails: GStreamer single-frame extraction at 5s cached in memory + temp file
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use iced::widget::image::Handle;
 use tracing::{error, info, warn};
+use gstreamer as gst;
+use gstreamer::prelude::*;
+use gstreamer_app as gst_app;
+use gstreamer_video as gst_video;
 
 #[derive(Debug, Clone)]
 pub enum PlayerCmd {
     TogglePause,
-    Seek(f32), // 0.0..=1.0
+    Seek(f32), // 0.0..=1.0 normalized
+    SeekTo(Duration),
+    SetVolume(f32), // 0.0..=1.0
+    Skip(i32), // seconds delta e.g. -10 / +10
     Stop,
 }
 

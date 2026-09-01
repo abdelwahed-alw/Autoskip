@@ -92,7 +92,7 @@ impl GStreamerEngine {
             .map_err(|_| OtipError::Video(VideoError::InitFailed("Failed to create videoscale".to_string())))?;
         
         let appsink = gst::ElementFactory::make("appsink")
-            .name("appsink")
+            .name("framesink")
             .property("emit-signals", true)
             .property("sync", false)
             .property("max-buffers", 1u32)
@@ -103,10 +103,10 @@ impl GStreamerEngine {
         let appsink = appsink.dynamic_cast::<gst_app::AppSink>()
             .map_err(|_| OtipError::Video(VideoError::InitFailed("Failed to cast appsink".to_string())))?;
 
-        // Configure appsink caps for frame extraction
+        // Configure appsink caps for RGBA frame extraction
         let (w, h) = self.config.frame_extraction_resolution;
         let caps = gst_video::VideoCapsBuilder::new()
-            .format(gst_video::VideoFormat::Rgb)
+            .format(gst_video::VideoFormat::Rgba)
             .width(w as i32)
             .height(h as i32)
             .build();
@@ -378,7 +378,6 @@ impl crate::engine::VideoEngine for GStreamerEngine {
     async fn set_volume(&mut self, video_id: VideoId, volume: f32) -> Result<()> {
         let instances = self.instances.read().await;
         if let Some(instance) = instances.get(&video_id) {
-            // Find volume element or use pipeline volume
             if let Some(volume_elem) = instance.pipeline.by_name("volume") {
                 volume_elem.set_property("volume", volume as f64);
             }
@@ -410,14 +409,10 @@ impl crate::engine::VideoEngine for GStreamerEngine {
         let instances = self.instances.read().await;
         if let Some(instance) = instances.get(&video_id) {
             let position = instance.pipeline.query_position::<gst::ClockTime>()
-                .ok()
-                .flatten()
-                .map(|t| Duration::from_nanos(t.nseconds()))
+                .map(|t| Duration::from_nanos(t.nseconds() as u64))
                 .unwrap_or(Duration::ZERO);
             let duration = instance.pipeline.query_duration::<gst::ClockTime>()
-                .ok()
-                .flatten()
-                .map(|t| Duration::from_nanos(t.nseconds()))
+                .map(|t| Duration::from_nanos(t.nseconds() as u64))
                 .unwrap_or(instance.metadata.duration);
             Ok((position, duration))
         } else {
@@ -463,9 +458,6 @@ impl crate::engine::VideoEngine for GStreamerEngine {
         let mut instances = self.instances.write().await;
         if let Some(mut instance) = instances.remove(&video_id) {
             instance.pipeline.set_state(gst::State::Null).ok();
-            if let Some(bus_watch) = instance.bus_watch.take() {
-                bus_watch.cancel();
-            }
             Ok(())
         } else {
             Ok(())
@@ -473,19 +465,8 @@ impl crate::engine::VideoEngine for GStreamerEngine {
     }
 }
 
-#[cfg(feature = "gstreamer")]
 impl Default for GStreamerEngine {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-#[cfg(not(feature = "gstreamer"))]
-pub struct GStreamerEngine;
-
-#[cfg(not(feature = "gstreamer"))]
-impl GStreamerEngine {
-    pub fn new() -> Self {
-        panic!("GStreamer feature not enabled");
     }
 }
