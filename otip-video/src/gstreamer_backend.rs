@@ -1,78 +1,103 @@
-//! GStreamer backend implementation
+//! GStreamer backend with AppSink for frame extraction
 
-#[cfg(feature = "gstreamer")]
 use std::collections::HashMap;
-#[cfg(feature = "gstreamer")]
+use std::path::Path;
 use std::sync::Arc;
-#[cfg(feature = "gstreamer")]
 use std::time::Duration;
-#[cfg(feature = "gstreamer")]
-use tokio::sync::{mpsc, RwLock, Mutex};
-#[cfg(feature = "gstreamer")]
+use tokio::sync::{mpsc, RwLock};
 use async_trait::async_trait;
-#[cfg(feature = "gstreamer")]
 use gstreamer as gst;
-#[cfg(feature = "gstreamer")]
 use gstreamer::prelude::*;
-#[cfg(feature = "gstreamer")]
 use gstreamer_app as gst_app;
-#[cfg(feature = "gstreamer")]
 use gstreamer_video as gst_video;
-#[cfg(feature = "gstreamer")]
 use otip_core::domain::{VideoId, VideoMetadata, PlaybackState};
-#[cfg(feature = "gstreamer")]
 use otip_core::error::{Result, OtipError, VideoError};
-#[cfg(feature = "gstreamer")]
-use otip_core::events::{VideoEngineEvent, VideoEngineResponse};
-#[cfg(feature = "gstreamer")]
-use image::{DynamicImage, ImageBuffer, Rgb};
-#[cfg(feature = "gstreamer")]
+use otip_core::events::VideoEngineResponse;
+use image::{DynamicImage, ImageBuffer, Rgb, Rgba, ImageEncoder};
+use image::codecs::png::PngEncoder;
 use tracing::{debug, info, warn, error};
+use crate::engine::EngineConfig;
 
-#[cfg(feature = "gstreamer")]
+/// Video engine trait - implemented by backends
+#[async_trait]
+pub trait VideoEngine: Send + Sync {
+    /// Initialize the engine with a video file
+    async fn initialize(&mut self, video_id: VideoId, path: &str) -> Result<VideoMetadata>;
+    
+    /// Start playback
+    async fn play(&mut self, video_id: VideoId) -> Result<()>;
+    
+    /// Pause playback
+    async fn pause(&mut self, video_id: VideoId) -> Result<()>;
+    
+    /// Stop playback
+    async fn stop(&mut self, video_id: VideoId) -> Result<()>;
+    
+    /// Seek to position
+    async fn seek(&mut self, video_id: VideoId, position: Duration) -> Result<()>;
+    
+    /// Set volume (0.0 - 1.0)
+    async fn set_volume(&mut self, video_id: VideoId, volume: f32) -> Result<()>;
+    
+    /// Set playback rate
+    async fn set_rate(&mut self, video_id: VideoId, rate: f32) -> Result<()>;
+    
+    /// Get current position and duration
+    async fn get_position(&self, video_id: VideoId) -> Result<(Duration, Duration)>;
+    
+    /// Get current playback state
+    async fn get_state(&self, video_id: VideoId) -> Result<PlaybackState>;
+    
+    /// Request a frame at specific timestamp (for scanning)
+    async fn request_frame(&mut self, video_id: VideoId, timestamp: Duration) -> Result<DynamicImage>;
+    
+    /// Check if hardware acceleration is available
+    fn hw_acceleration_available(&self) -> bool;
+    
+    /// Get engine type identifier
+    fn engine_type(&self) -> crate::engine::EngineType;
+    
+    /// Shutdown the engine
+    async fn shutdown(&mut self, video_id: VideoId) -> Result<()>;
+}
+
+/// GStreamer video engine implementation
+pub struct GStreamerEngine {
+    config: EngineConfig,
+    instances: Arc<RwLock<HashMap<VideoId, GstInstance>>>,
+    event_tx: Option<mpsc::UnboundedSender<VideoEngineResponse>>,
+}
+
 struct GstInstance {
     pipeline: gst::Pipeline,
     appsink: gst_app::AppSink,
     metadata: VideoMetadata,
     state: PlaybackState,
-    frame_request_tx: mpsc::UnboundedSender<(Duration, mpsc::UnboundedSender<Result<DynamicImage>>)>,
-    bus_watch: Option<gst::BusWatch>,
+    frame_tx: mpsc::UnboundedSender<DynamicImage>,
 }
 
-#[cfg(feature = "gstreamer")]
-pub struct GStreamerEngine {
-    config: crate::EngineConfig,
-    instances: Arc<RwLock<HashMap<VideoId, GstInstance>>>,
-    event_tx: Option<mpsc::UnboundedSender<VideoEngineResponse>>,
-    #[allow(dead_code)]
-    context: gst::MainContext,
-}
-
-#[cfg(feature = "gstreamer")]
 impl GStreamerEngine {
     pub fn new() -> Self {
         gst::init().expect("Failed to initialize GStreamer");
         
         Self {
-            config: crate::EngineConfig::default(),
+            config: EngineConfig::default(),
             instances: Arc::new(RwLock::new(HashMap::new())),
             event_tx: None,
-            context: gst::MainContext::default(),
         }
     }
 
-    pub fn with_config(config: crate::EngineConfig) -> Self {
+    pub fn with_config(config: EngineConfig) -> Self {
         gst::init().expect("Failed to initialize GStreamer");
         
         Self {
             config,
             instances: Arc::new(RwLock::new(HashMap::new())),
             event_tx: None,
-            context: gst::MainContext::default(),
         }
     }
 
-    fn create_pipeline(&self, video_id: VideoId, path: &str) -> Result<(gst::Pipeline, gst_app::AppSink, mpsc::UnboundedSender<(Duration, mpsc::UnboundedSender<Result<DynamicImage>>)>)> {
+    fn create_pipeline(&self, path: &str) -> Result<(gst::Pipeline, gst_app::AppSink, mpsc::UnboundedSender<DynamicImage>)> {
         let pipeline = gst::Pipeline::new();
         
         // Create elements

@@ -29,104 +29,131 @@ pub enum PlayerEvent {
     Frame(Handle),
     Error(String),
     Ready { duration: Duration, width: u32, height: u32 },
+    PositionUpdate { position: Duration, duration: Duration },
+    VolumeChanged(f32),
+    StateChanged(bool), // true=playing
 }
 
-/// Global handle for subscription polling (Subscription::run needs fn() -> Stream, no capture)
-/// Fixed: was `OnceLock` which could only be set once — second `VideoSelected` never updated
-/// the subscription, so new video frames were sent to a channel the UI never polled.
-/// Now `LazyLock<Mutex<Option<...>>>` allows replacement on each `spawn`.
+/// Global handle for subscription polling
 pub static FRAME_RX_GLOBAL: LazyLock<std::sync::Mutex<Option<Arc<Mutex<mpsc::UnboundedReceiver<PlayerEvent>>>>>> =
     LazyLock::new(|| std::sync::Mutex::new(None));
 
-/// Handle to the background MPV task. Cheap to clone for UI.
+/// Handle to the background GStreamer task. Cheap to clone for UI.
 #[derive(Debug, Clone)]
 pub struct VideoPlayerHandle {
     pub cmd_tx: mpsc::UnboundedSender<PlayerCmd>,
     pub event_rx: Arc<Mutex<mpsc::UnboundedReceiver<PlayerEvent>>>,
+    _pipeline: Arc<gst::Pipeline>,
 }
 
 impl VideoPlayerHandle {
-    /// Spawn background MPV thread. Never blocks Iced's async executor.
+    /// Spawn background GStreamer thread. Never blocks Iced's async executor.
     pub fn spawn(path: PathBuf) -> Self {
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<PlayerCmd>();
         let (evt_tx, evt_rx) = mpsc::unbounded_channel::<PlayerEvent>();
         let path_for_global = path.clone();
 
-        // ── Background Thread ──────────────────────────────────────────
-        // spawn_blocking so mpv's blocking wait_event never stalls UI
-        // Uses unbounded channels (requirement #4) so neither side ever awaits
-        // while holding a lock.
+        // Create GStreamer pipeline
+        gstreamer::init().expect("Failed to initialize GStreamer");
+
+        let (pipeline, _appsink, mut frame_rx) = create_pipeline(&path);
+
+        // Start pipeline
+        pipeline
+            .set_state(gst::State::Playing)
+            .expect("Failed to start pipeline");
+
+        let pipeline_arc = Arc::new(pipeline);
+        let pipeline_clone = pipeline_arc.clone();
+        let evt_tx_for_frames = evt_tx.clone();
+        let evt_tx_for_cmd = evt_tx.clone();
+
+        // Spawn command handling thread
         tokio::task::spawn_blocking(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .expect("rt");
             rt.block_on(async move {
-                info!("MPV init for {:?}", path);
+                info!("GStreamer init for {:?}", path);
 
-                // ── Real MPV initialization with correct API (requirements #1, #2) ──
-                // Correct Frame Extraction API:
-                //   Preferred: RenderContext API (mpv 0.2: MpvHandlerWithGl::draw + glReadPixels,
-                //               newer libmpv2: RenderContext::render) with vo=libmpv / gpu
-                //   Fallback headless (no GL): vo=image (or vo=null) + hwdec=no
-                // Both force mpv to output raw RGB/RGBA to CPU memory instead of GPU-only.
-                let mpv_result: Result<mpv::MpvHandler, String> = (|| {
-                    let mut builder = mpv::MpvHandlerBuilder::new().map_err(|e| format!("mpv_create: {e:?}"))?;
-                    // Requirement #2: force CPU frames
-                    // RenderContext path — use libmpv (opengl-cb) so draw() can read back RGBA
-                    builder.set_option("vo", "libmpv").map_err(|e| format!("vo libmpv: {e:?}"))?;
-                    // Headless alternative (if no GL context): builder.set_option("vo", "image").unwrap();
-                    // Must disable hardware decoding to keep frames on CPU (not VDPAU/VAAPI GPU surface)
-                    builder.set_option("hwdec", "no").map_err(|e| format!("hwdec no: {e:?}"))?;
-                    builder.set_option("keep-open", "yes").map_err(|e| format!("{e:?}"))?;
-                    // Build (mpv_initialize) — must be before any property/command
-                    let mut mpv = builder.build().map_err(|e| format!("mpv_initialize: {e:?}"))?;
-                    // Load file
-                    mpv.command(&["loadfile", path.to_str().unwrap_or(""), "replace"])
-                        .map_err(|e| format!("loadfile: {e:?}"))?;
-                    // Requirement #1: Auto-Play — mpv may start paused depending on config/auto-pause
-                    // Immediately unpause so frames start flowing and Message::FrameReady fires.
-                    // Both forms are valid; we do both for robustness.
-                    let _ = mpv.set_property("pause", false);
-                    let _ = mpv.command(&["set", "pause", "no"]);
-                    info!("MPV auto-play: set pause no for {:?}", path);
-                    Ok(mpv)
-                })();
-
-                let mut mpv = match mpv_result {
-                    Ok(h) => {
-                        let _ = evt_tx.send(PlayerEvent::Ready { duration: Duration::from_secs(0), width: 640, height: 360 });
-                        Some(h)
-                    }
-                    Err(e) => {
-                        error!("MPV init failed (will keep polling for UI, no frames): {}", e);
-                        let _ = evt_tx.send(PlayerEvent::Error(e));
-                        None
-                    }
-                };
+                let _ = evt_tx.send(PlayerEvent::Ready {
+                    duration: Duration::from_secs(0),
+                    width: 640,
+                    height: 360,
+                });
 
                 let mut paused = false;
-                // ── Frame loop ───────────────────────────────────────
-                // Non-blocking pattern (requirement #4):
-                // - cmd_rx: unbounded, use try_recv inside blocking thread (never await)
-                // - evt_tx: unbounded, .send is non-blocking (no await, no deadlock)
-                // - Sleep 33ms yields to runtime (~30fps) without busy loop
                 loop {
-                    // Handle UI commands without blocking (try_recv, not recv().await)
+                    // Handle UI commands
                     while let Ok(cmd) = cmd_rx.try_recv() {
                         match cmd {
                             PlayerCmd::TogglePause => {
                                 paused = !paused;
-                                if let Some(m) = mpv.as_mut() {
-                                    let _ = m.set_property("pause", paused);
-                                    // also explicit command for compatibility
-                                    let _ = m.command(&["set", "pause", if paused { "yes" } else { "no" }]);
-                                }
+                                let state = if paused {
+                                    gst::State::Paused
+                                } else {
+                                    gst::State::Playing
+                                };
+                                let _ = pipeline_clone.set_state(state);
+                                let _ = evt_tx_for_cmd.send(PlayerEvent::StateChanged(!paused));
                             }
                             PlayerCmd::Seek(pos) => {
-                                if let Some(m) = mpv.as_mut() {
-                                    let _ = m.set_property("time-pos", (pos * 120.0) as f64);
-                                }
+                                // pos is 0.0..1.0 -> seek by querying duration
+                                let duration = pipeline_clone
+                                    .query_duration::<gst::ClockTime>()
+                                    .map(|t| Duration::from_nanos(t.nseconds()))
+                                    .unwrap_or(Duration::from_secs(120));
+                                let target = Duration::from_secs_f64(duration.as_secs_f64() * pos.clamp(0.0, 1.0) as f64);
+                                let seek_event = gst::event::Seek::new(
+                                    1.0,
+                                    gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
+                                    gst::SeekType::Set,
+                                    gst::ClockTime::from_nseconds((target.as_nanos() as u64).try_into().unwrap_or(u64::MAX)),
+                                    gst::SeekType::None,
+                                    gst::ClockTime::NONE,
+                                );
+                                let _ = pipeline_clone.send_event(seek_event);
+                            }
+                            PlayerCmd::SeekTo(pos) => {
+                                let seek_event = gst::event::Seek::new(
+                                    1.0,
+                                    gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
+                                    gst::SeekType::Set,
+                                    gst::ClockTime::from_nseconds((pos.as_nanos() as u64).try_into().unwrap_or(u64::MAX)),
+                                    gst::SeekType::None,
+                                    gst::ClockTime::NONE,
+                                );
+                                let _ = pipeline_clone.send_event(seek_event);
+                            }
+                            PlayerCmd::SetVolume(vol) => {
+                                let v = vol.clamp(0.0, 1.0) as f64;
+                                pipeline_clone.set_property("volume", v);
+                                let _ = evt_tx_for_cmd.send(PlayerEvent::VolumeChanged(v as f32));
+                            }
+                            PlayerCmd::Skip(delta_secs) => {
+                                let pos = pipeline_clone
+                                    .query_position::<gst::ClockTime>()
+                                    .map(|t| Duration::from_nanos(t.nseconds()))
+                                    .unwrap_or(Duration::ZERO);
+                                let duration = pipeline_clone
+                                    .query_duration::<gst::ClockTime>()
+                                    .map(|t| Duration::from_nanos(t.nseconds()))
+                                    .unwrap_or(Duration::from_secs(3600));
+                                let new_pos = if delta_secs < 0 {
+                                    pos.saturating_sub(Duration::from_secs((-delta_secs) as u64))
+                                } else {
+                                    (pos + Duration::from_secs(delta_secs as u64)).min(duration)
+                                };
+                                let seek_event = gst::event::Seek::new(
+                                    1.0,
+                                    gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
+                                    gst::SeekType::Set,
+                                    gst::ClockTime::from_nseconds((new_pos.as_nanos() as u64).try_into().unwrap_or(u64::MAX)),
+                                    gst::SeekType::None,
+                                    gst::ClockTime::NONE,
+                                );
+                                let _ = pipeline_clone.send_event(seek_event);
                             }
                             PlayerCmd::Stop => return,
                         }
