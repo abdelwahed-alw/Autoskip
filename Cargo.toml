@@ -45,16 +45,15 @@ imageproc = "0.25"
 base64 = "0.22"
 
 # GUI
-iced = { version = "0.14", features = ["canvas", "image", "tokio"] }
+iced = { version = "0.14", features = ["canvas", "image", "tokio", "advanced"] }
 # iced_aw = { version = "0.12", features = ["tab_bar", "selection_list"] }
 
-# Video
+# Video - libmpv hardware rendering (zero-copy)
 mpv = { version = "0.2" }
-gstreamer = { version = "0.21", features = ["v1_20"] }
-gstreamer-video = { version = "0.21", features = ["v1_20"] }
-gstreamer-app = { version = "0.21", features = ["v1_20"] }
-gstreamer-gl = { version = "0.21", features = ["v1_20"] }
-gstreamer-base = { version = "0.21", features = ["v1_20"] }
+libmpv2 = { version = "6.0", features = ["render"] }
+wgpu = { version = "0.20", features = ["wgsl"] }
+ash = "0.38"
+raw-window-handle = "0.6"
 
 # Hardware
 

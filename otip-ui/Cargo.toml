@@ -6,7 +6,7 @@ description = "Iced-based UI for Otip video player"
 
 [dependencies]
 otip-core = { path = "../otip-core" }
-otip-video = { path = "../otip-video", features = ["gstreamer"] }
+otip-video = { path = "../otip-video", features = ["mpv"] }
 otip-ai = { path = "../otip-ai" }
 iced = { workspace = true }
 tokio = { workspace = true, features = ["full", "sync", "time", "macros", "fs", "process"] }

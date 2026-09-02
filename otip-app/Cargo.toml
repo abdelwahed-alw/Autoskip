@@ -6,7 +6,7 @@ description = "Otip video player binary"
 
 [dependencies]
 otip-core = { path = "../otip-core" }
-otip-video = { path = "../otip-video", features = ["gstreamer"] }
+otip-video = { path = "../otip-video", features = ["mpv"] }
 iced = { workspace = true }
 tokio = { workspace = true, features = ["full", "macros", "sync", "time", "fs", "rt-multi-thread"] }
 tracing = { workspace = true, features = ["std", "log"] }
@@ -16,10 +16,8 @@ rfd = { workspace = true }
 dirs = { workspace = true }
 walkdir = { workspace = true }
 image = { workspace = true }
-gstreamer = { workspace = true }
-gstreamer-app = { workspace = true }
-gstreamer-video = { workspace = true }
-gstreamer-base = { workspace = true }
+libmpv2 = { workspace = true }
+wgpu = { workspace = true }
 
 [[bin]]
 name = "otip"

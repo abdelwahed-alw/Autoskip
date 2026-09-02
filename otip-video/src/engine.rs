@@ -55,7 +55,6 @@ pub trait VideoEngine: Send + Sync {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EngineType {
     Mpv,
-    GStreamer,
 }
 
 /// Handle to a running video engine
@@ -70,52 +69,18 @@ pub struct VideoEngineHandle {
 pub struct VideoEngineFactory;
 
 impl VideoEngineFactory {
-    /// Create the best available engine
+    /// Create the best available engine - now libmpv only (zero-copy hwdec)
     pub fn create_best() -> Box<dyn VideoEngine> {
-        #[cfg(feature = "gstreamer")]
-        {
-            if GStreamerEngine::is_available() {
-                return Box::new(GStreamerEngine::new());
-            }
+        if MpvEngine::is_available() {
+            return Box::new(MpvEngine::new());
         }
-        
-        #[cfg(feature = "mpv")]
-        {
-            if MpvEngine::is_available() {
-                return Box::new(MpvEngine::new());
-            }
-        }
-        
-        panic!("No video engine available. Enable 'mpv' or 'gstreamer' feature.");
+        panic!("No video engine available. Enable 'mpv' feature.");
     }
 
     /// Create specific engine type
     pub fn create(engine_type: EngineType) -> Result<Box<dyn VideoEngine>> {
         match engine_type {
-            EngineType::Mpv => {
-                #[cfg(feature = "mpv")]
-                {
-                    Ok(Box::new(MpvEngine::new()))
-                }
-                #[cfg(not(feature = "mpv"))]
-                {
-                    Err(OtipError::Video(VideoError::InitFailed(
-                        "MPV feature not enabled".to_string()
-                    )))
-                }
-            }
-            EngineType::GStreamer => {
-                #[cfg(feature = "gstreamer")]
-                {
-                    Ok(Box::new(GStreamerEngine::new()))
-                }
-                #[cfg(not(feature = "gstreamer"))]
-                {
-                    Err(OtipError::Video(VideoError::InitFailed(
-                        "GStreamer feature not enabled".to_string()
-                    )))
-                }
-            }
+            EngineType::Mpv => Ok(Box::new(MpvEngine::new())),
         }
     }
 }
@@ -144,22 +109,6 @@ impl Default for EngineConfig {
     }
 }
 
-#[cfg(feature = "gstreamer")]
-pub mod gstreamer_engine {
-    use super::*;
-    use crate::gstreamer_backend::GStreamerEngine;
-
-    impl GStreamerEngine {
-        pub fn is_available() -> bool {
-            gstreamer::init().is_ok()
-        }
-    }
-}
-
-#[cfg(feature = "gstreamer")]
-pub use crate::gstreamer_backend::GStreamerEngine;
-
-#[cfg(feature = "mpv")]
 pub mod mpv_engine {
     use super::*;
     use crate::mpv_backend::MpvEngine;
@@ -171,5 +120,4 @@ pub mod mpv_engine {
     }
 }
 
-#[cfg(feature = "mpv")]
 pub use crate::mpv_backend::MpvEngine;

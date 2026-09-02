@@ -19,16 +19,16 @@ image = { workspace = true, features = ["png", "jpeg"] }
 bytes = { workspace = true }
 chrono = { workspace = true, features = ["serde", "clock"] }
 
-# GStreamer backend (AppSink for frame extraction)
-gstreamer = { workspace = true, optional = true }
-gstreamer-video = { workspace = true, optional = true }
-gstreamer-app = { workspace = true, optional = true }
-gstreamer-gl = { workspace = true, optional = true }
-gstreamer-base = { workspace = true, optional = true }
+# libmpv backend (render_context + wgpu zero-copy)
+libmpv2 = { workspace = true, optional = true }
+wgpu = { workspace = true, optional = true }
+ash = { workspace = true, optional = true }
+raw-window-handle = { workspace = true, optional = true }
 
 [features]
-default = ["gstreamer"]
-gstreamer = ["dep:gstreamer", "dep:gstreamer-video", "dep:gstreamer-app", "dep:gstreamer-gl", "dep:gstreamer-base"]
+default = ["mpv"]
+mpv = ["dep:libmpv2", "dep:wgpu", "dep:ash", "dep:raw-window-handle"]
+gstreamer = []
 cuda = []
 vulcan = []
 
