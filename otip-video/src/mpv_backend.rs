@@ -29,10 +29,6 @@ pub struct MpvEngine {
 struct MpvInstance {
     #[cfg(feature = "mpv")]
     mpv: Arc<libmpv2::Mpv>,
-    #[cfg(feature = "mpv")]
-    render_ctx: Option<Box<dyn std::any::Any + Send + Sync>>, // Type-erased render context
-    #[cfg(feature = "mpv")]
-    texture: Option<wgpu::Texture>,
     metadata: VideoMetadata,
     state: PlaybackState,
     started_at: Instant,
@@ -174,10 +170,10 @@ impl crate::engine::VideoEngine for MpvEngine {
             // Create shared texture and render context for zero-copy rendering
             // In real impl, we'd get the wgpu Device from Iced and create the texture
             // For now, we store the mpv instance and render context will be created when Device is available
+            // Create shared texture and render context for zero-copy rendering
+            // In real impl, we'd get the wgpu Device from Iced and create the texture
             let inst = MpvInstance {
                 mpv: mpv.clone(),
-                render_ctx: None,
-                texture: None,
                 metadata: VideoMetadata {
                     id: video_id,
                     path: path.to_string(),

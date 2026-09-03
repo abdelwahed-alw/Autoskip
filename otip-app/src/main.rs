@@ -757,11 +757,10 @@ impl OtipApp {
         // No CPU appsink, no Handle::from_rgba per frame.
         // Wire Custom Widget: STOP using iced::widget::image(handle) for video playback
         // Use MpvWgpuWidget (zero-copy shared wgpu texture via mpv_render_context)
-        // Wire Custom Widget: use MpvWgpuWidget (zero-copy) not image(handle)
-        let video_area: Element<Message> = if let Some(_player) = &self.video_player {
+        let video_area: Element<Message> = if let Some(player) = &self.video_player {
             // Trigger Renders: mpv_render_context_render is called inside the widget's draw
             // The widget owns the shared wgpu::TextureView that mpv wrote into via FBO (hwdec=auto)
-            video_player::widget::MpvWgpuWidget::new(None, 1280, 720).into()
+            video_player::widget::MpvWgpuWidget::new(player.mpv.clone(), 1280, 720).into()
         } else if let Some(handle) = &self.video_handle {
             image(handle.clone()).width(Length::Fill).height(Length::Fill).into()
         } else {
