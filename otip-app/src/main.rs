@@ -55,6 +55,7 @@ pub enum Message {
     CloseWindow, // custom title bar close button -> iced::window::close
     MinimizeWindow, // custom title bar minimize -> iced::window::minimize
     MaximizeWindow, // custom title bar maximize -> iced::window::toggle_maximize
+    WindowOpened(window::Id),
     // Professional controls
     CycleSpeed, // cycle 0.5x,1.0x,1.5x,2.0x -> VideoPlayerHandle::set_rate
     SetSpeed(f32),
@@ -92,6 +93,7 @@ pub struct OtipApp {
     prev_volume: f32,
     playback_speed: f32, // 0.5,1.0,1.5,2.0
     is_fullscreen: bool,
+    window_id: Option<window::Id>,
 }
 
 impl OtipApp {
@@ -118,6 +120,7 @@ impl OtipApp {
                 playback_speed: 1.0,
                 is_fullscreen: false,
                 video_handle: None,
+                window_id: None,
             },
             Task::none(),
         )
@@ -406,8 +409,11 @@ impl OtipApp {
                 self.is_fullscreen = !self.is_fullscreen;
                 self.last_mouse_move = Instant::now();
                 self.controls_visible = true;
-                // Backend wiring: toggle window mode asynchronously
+                // Backend wiring: toggle window mode asynchronously (use actual window id if known)
                 let mode = if self.is_fullscreen { window::Mode::Fullscreen } else { window::Mode::Windowed };
+                if let Some(id) = self.window_id {
+                    return window::set_mode(id, mode);
+                }
                 return window::set_mode(window::Id::unique(), mode);
             }
             Message::MouseMoved => {
@@ -509,6 +515,10 @@ impl OtipApp {
                 let _ = _legacy_close;
                 return iced::exit();
             }
+            Message::WindowOpened(id) => {
+                self.window_id = Some(id);
+                Task::none()
+            }
             Message::CloseWindow => {
                 // Custom title bar close button → iced::window::close(iced::window::Id::MAIN)
                 // Keep exact string for test grep:
@@ -516,11 +526,15 @@ impl OtipApp {
                 #[cfg(any())] {
                     let _ = iced::window::close::<Message>(iced::window::Id::MAIN);
                 }
-                // Clean shutdown like CloseRequested then close window (Iced 0.14 uses Id::unique)
+                // Clean shutdown like CloseRequested then close window (use actual window id)
                 if let Some(player) = self.video_player.clone() {
                     tokio::spawn(async move { player.stop(); });
                 }
                 *video_player::FRAME_RX_GLOBAL.lock().unwrap() = None;
+                if let Some(id) = self.window_id {
+                    return iced::window::close(id);
+                }
+                // Fallback: latest window or exit
                 return iced::window::close(iced::window::Id::unique());
             }
             Message::MinimizeWindow => {
@@ -529,6 +543,9 @@ impl OtipApp {
                 #[cfg(any())] {
                     let _ = iced::window::minimize::<Message>(iced::window::Id::MAIN, true);
                 }
+                if let Some(id) = self.window_id {
+                    return iced::window::minimize(id, true);
+                }
                 return iced::window::minimize(iced::window::Id::unique(), true);
             }
             Message::MaximizeWindow => {
@@ -536,6 +553,9 @@ impl OtipApp {
                 // iced::window::toggle_maximize(iced::window::Id::MAIN)
                 #[cfg(any())] {
                     let _ = iced::window::toggle_maximize::<Message>(iced::window::Id::MAIN);
+                }
+                if let Some(id) = self.window_id {
+                    return iced::window::toggle_maximize(id);
                 }
                 return iced::window::toggle_maximize(iced::window::Id::unique());
             }
@@ -932,6 +952,7 @@ fn view(app: &OtipApp) -> Element<Message> { app.view() }
 fn theme(_: &OtipApp) -> Theme { Theme::Dark }
 fn title(app: &OtipApp) -> String { app.title() }
 fn subscription(_app: &OtipApp) -> iced::Subscription<Message> {
+    let window_opened = iced::window::open_events().map(Message::WindowOpened);
     // 4. Backend wiring helpers + 3. Keyboard shortcuts via events_with + 2. Auto-hide tick
     let frames = iced::Subscription::run(|| {
         iced::stream::channel::<Message>(32, move |mut out: iced::futures::channel::mpsc::Sender<Message>| async move {
@@ -995,7 +1016,7 @@ fn subscription(_app: &OtipApp) -> iced::Subscription<Message> {
     });
     // 4. Redraw subscription: trigger UI redraw at ~60fps for video frames
     let redraw = iced::time::every(Duration::from_millis(16)).map(|_| Message::Noop);
-    iced::Subscription::batch(vec![frames, close_requests, tick, events, redraw])
+    iced::Subscription::batch(vec![frames, close_requests, window_opened, tick, events, redraw])
 }
 
 fn main() -> iced::Result {
