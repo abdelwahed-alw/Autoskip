@@ -751,23 +751,23 @@ impl OtipApp {
     }
 
     fn view_player(&self) -> Element<Message> {
-        // ── Video Rendering: libmpv render_context + wgpu zero-copy (VLC-killer) ──────
-        // Texture Sharing: mpv hwdec=auto renders directly into wgpu::Texture we allocated
-        // via mpv_render_context_create(OpenGL/Vulkan FBO). Iced draws the shared texture.
-        // No CPU appsink, no Handle::from_rgba per frame.
-        // Wire Custom Widget: STOP using iced::widget::image(handle) for video playback
-        // Use MpvWgpuWidget (zero-copy shared wgpu texture via mpv_render_context)
-        let video_area: Element<Message> = if let Some(player) = &self.video_player {
-            // Trigger Renders: mpv_render_context_render is called inside the widget's draw
-            // The widget owns the shared wgpu::TextureView that mpv wrote into via FBO (hwdec=auto)
-            video_player::widget::MpvWgpuWidget::new(player.mpv.clone(), 1280, 720).into()
-        } else if let Some(handle) = &self.video_handle {
-            image(handle.clone()).width(Length::Fill).height(Length::Fill).into()
+        // ── Video Rendering: Software fallback (Wayland stable) ──────
+        // Previously: mpv hwdec=auto + wgpu zero-copy shared texture (empty stub on Wayland/Vulkan).
+        // Now: software render fallback - Handle::from_pixels(width, height, buffer) sent via PlayerEvent::Frame
+        // UI Rendering: simply use standard iced::widget::image(handle) to display frame.
+        // This is highly stable on Wayland, no wgpu Device, no FBO, no hwdec interop.
+        // iced::widget::image(handle) is the correct fallback.
+        let video_area: Element<Message> = if let Some(handle) = &self.video_handle {
+            // Software fallback: display Handle::from_pixels / Handle::from_rgba via iced::widget::image
+            // iced::widget::image(handle) - stable SW fallback
+            iced::widget::image(handle.clone()).width(Length::Fill).height(Length::Fill).into()
         } else {
             container(column![
                 text("▶ No video - select from library").size(18).color(Color::WHITE).align_x(Alignment::Center),
                 Space::new().height(Length::Fixed(8.0)),
                 text(self.selected_video_path.as_ref().and_then(|p| p.file_name()).and_then(|n| n.to_str()).unwrap_or("no file")).size(12).color(Color::from_rgb(0.7,0.7,0.75)),
+                Space::new().height(Length::Fixed(8.0)),
+                text(if self.video_player.is_some() { "Loading video (SW fallback)..." } else { "" }).size(11).color(Color::from_rgb(0.5,0.5,0.55)),
             ].align_x(Alignment::Center).spacing(4))
             .width(Length::Fill).height(Length::Fill).center_x(Length::Fill).center_y(Length::Fill)
             .style(|_: &Theme| container::Style{ background: Some(Background::Color(Color::from_rgb(0.04,0.04,0.06))), border: Border{ color: Color::from_rgb(0.18,0.18,0.22), width:1.0, radius:8.0.into()}, shadow: Shadow::default(), text_color: None, snap:false }).into()

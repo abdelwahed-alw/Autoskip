@@ -4008,6 +4008,7 @@ dependencies = [
  "iced",
  "image",
  "libmpv2",
+ "libmpv2-sys",
  "otip-core",
  "otip-video",
  "rfd",

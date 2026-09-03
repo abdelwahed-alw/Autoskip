@@ -17,6 +17,7 @@ dirs = { workspace = true }
 walkdir = { workspace = true }
 image = { workspace = true }
 libmpv2 = { workspace = true }
+libmpv2-sys = "4.0"
 wgpu = { workspace = true }
 
 [[bin]]
