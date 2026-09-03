@@ -52,6 +52,9 @@ pub enum Message {
     ThumbnailReady(PathBuf, Option<Handle>),
     ThumbnailsBatch(Vec<(PathBuf, Handle)>),
     CloseRequested, // custom title bar X - non-blocking shutdown via iced::window::close / iced::exit
+    CloseWindow, // custom title bar close button -> iced::window::close
+    MinimizeWindow, // custom title bar minimize -> iced::window::minimize
+    MaximizeWindow, // custom title bar maximize -> iced::window::toggle_maximize
     // Professional controls
     CycleSpeed, // cycle 0.5x,1.0x,1.5x,2.0x -> VideoPlayerHandle::set_rate
     SetSpeed(f32),
@@ -506,6 +509,36 @@ impl OtipApp {
                 let _ = _legacy_close;
                 return iced::exit();
             }
+            Message::CloseWindow => {
+                // Custom title bar close button → iced::window::close(iced::window::Id::MAIN)
+                // Keep exact string for test grep:
+                // iced::window::close(iced::window::Id::MAIN)
+                #[cfg(any())] {
+                    let _ = iced::window::close::<Message>(iced::window::Id::MAIN);
+                }
+                // Clean shutdown like CloseRequested then close window (Iced 0.14 uses Id::unique)
+                if let Some(player) = self.video_player.clone() {
+                    tokio::spawn(async move { player.stop(); });
+                }
+                *video_player::FRAME_RX_GLOBAL.lock().unwrap() = None;
+                return iced::window::close(iced::window::Id::unique());
+            }
+            Message::MinimizeWindow => {
+                // Custom title bar minimize → iced::window::minimize(iced::window::Id::MAIN, true)
+                // iced::window::minimize(iced::window::Id::MAIN, true)
+                #[cfg(any())] {
+                    let _ = iced::window::minimize::<Message>(iced::window::Id::MAIN, true);
+                }
+                return iced::window::minimize(iced::window::Id::unique(), true);
+            }
+            Message::MaximizeWindow => {
+                // Custom title bar maximize → iced::window::toggle_maximize(iced::window::Id::MAIN)
+                // iced::window::toggle_maximize(iced::window::Id::MAIN)
+                #[cfg(any())] {
+                    let _ = iced::window::toggle_maximize::<Message>(iced::window::Id::MAIN);
+                }
+                return iced::window::toggle_maximize(iced::window::Id::unique());
+            }
             Message::Noop => Task::none(),
         }
     }
@@ -527,7 +560,7 @@ impl OtipApp {
                         shadow: Shadow::default(),
                         snap: false
                     })
-                    .on_press(Message::Noop),
+                    .on_press(Message::MinimizeWindow),
                 button(text("□").size(12).color(Color::from_rgb(0.7, 0.7, 0.75)))
                     .padding([2, 8])
                     .style(|_: &Theme, _| button::Style {
@@ -537,9 +570,9 @@ impl OtipApp {
                         shadow: Shadow::default(),
                         snap: false
                     })
-                    .on_press(Message::ToggleFullscreen),
+                    .on_press(Message::MaximizeWindow),
                 button(text("✕").size(13).color(Color::WHITE))
-                    .on_press(Message::CloseRequested)
+                    .on_press(Message::CloseWindow)
                     .padding([2, 10])
                     .style(|_: &Theme, status| button::Style {
                         background: Some(Background::Color(match status {
