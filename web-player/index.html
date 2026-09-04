@@ -1,0 +1,573 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Modern Video Player — Demo & Integration</title>
+  <meta name="description" content="Modern, responsive HTML5 video player with custom controls, playlist, chapters, PiP, captions, and keyboard shortcuts. Dark theme." />
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="css/player.css" />
+  <style>
+    /* Demo page styling (outside player component) */
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; }
+    body {
+      font-family: 'Inter', system-ui, -apple-system, sans-serif;
+      background: #080808;
+      color: #e5e7eb;
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+    }
+    a { color: var(--mv-accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .topbar {
+      position: sticky; top: 0; z-index: 50;
+      backdrop-filter: blur(14px) saturate(1.2);
+      -webkit-backdrop-filter: blur(14px) saturate(1.2);
+      background: rgba(10,10,10,.78);
+      border-bottom: 1px solid #1f1f1f;
+    }
+    .topbar__inner {
+      max-width: 1280px; margin: 0 auto; padding: 14px 16px;
+      display: flex; align-items: center; justify-content: space-between; gap: 16px;
+    }
+    .brand {
+      display: flex; align-items: center; gap: 12px; font-weight: 800; letter-spacing: -.02em;
+    }
+    .brand__logo {
+      width: 36px; height: 36px; border-radius: 9px;
+      background: linear-gradient(135deg, var(--mv-accent), #06b6d4);
+      display: grid; place-items: center; color: #00110d; font-weight: 800;
+      box-shadow: 0 4px 16px rgba(var(--mv-accent-rgb) / .35);
+    }
+    .brand__name { font-size: 16px; color: #fff; }
+    .brand__sub { font-size: 12.5px; color: #9ca3af; font-weight: 500; letter-spacing: .02em; }
+    .topbar__actions { display: flex; gap: 8px; align-items: center; }
+    .btn {
+      appearance: none; border: 1px solid #2a2a2a; background: #1a1a1a; color: #e5e7eb;
+      padding: 8px 14px; border-radius: 999px; font-size: 13px; font-weight: 600; cursor: pointer;
+      transition: background .15s ease, border-color .15s ease, transform .1s ease;
+    }
+    .btn:hover { background: #242424; border-color: #333; }
+    .btn:active { transform: scale(.98); }
+    .btn--primary { background: var(--mv-accent); color: #00110d; border-color: var(--mv-accent); }
+    .btn--primary:hover { background: var(--mv-accent-hover); border-color: var(--mv-accent-hover); }
+    .hero {
+      max-width: 1280px; margin: 0 auto; padding: 28px 16px 8px;
+    }
+    .hero h1 {
+      font-size: clamp(26px, 4vw, 36px); font-weight: 800; letter-spacing: -.03em; line-height: 1.1; margin: 0 0 10px; color: #fff;
+    }
+    .hero h1 span { background: linear-gradient(90deg, var(--mv-accent), #38bdf8); -webkit-background-clip: text; background-clip: text; color: transparent; }
+    .hero p { margin: 0; color: #a1a1aa; max-width: 760px; font-size: 15px; }
+    .hero__badges { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
+    .badge {
+      font-size: 11px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase;
+      background: #1a1a1a; border: 1px solid #262626; color: #d4d4d8; padding: 6px 10px; border-radius: 999px;
+    }
+    .badge--accent { background: rgba(var(--mv-accent-rgb) / .12); border-color: rgba(var(--mv-accent-rgb) / .22); color: var(--mv-accent); }
+
+    .mv-layout { max-width: 1280px; margin: 20px auto; padding: 0 16px; }
+    .demo-card {
+      background: #0f0f0f; border: 1px solid #1f1f1f; border-radius: 16px; padding: 14px;
+    }
+    .features {
+      max-width: 1280px; margin: 24px auto; padding: 0 16px;
+      display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px;
+    }
+    .feature {
+      background: #111; border: 1px solid #1f1f1f; border-radius: 12px; padding: 16px;
+    }
+    .feature h3 { margin: 0 0 6px; font-size: 13px; font-weight: 700; color: #fff; letter-spacing: -.01em; }
+    .feature p { margin: 0; font-size: 12.5px; color: #9ca3af; line-height: 1.5; }
+    .feature__icon {
+      width: 32px; height: 32px; border-radius: 8px; background: #1e1e1e; border: 1px solid #2a2a2a;
+      display: grid; place-items: center; margin-bottom: 10px; color: var(--mv-accent);
+    }
+    .guide {
+      max-width: 1280px; margin: 24px auto; padding: 0 16px; display: grid; gap: 16px;
+    }
+    .guide__card {
+      background: #0f0f0f; border: 1px solid #1f1f1f; border-radius: 16px; overflow: hidden;
+    }
+    .guide__header {
+      padding: 18px 20px 14px; border-bottom: 1px solid #1f1f1f; background: #111;
+      display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    }
+    .guide__header h2 { margin: 0; font-size: 15px; font-weight: 700; color: #fff; }
+    .guide__header p { margin: 4px 0 0; font-size: 13px; color: #9ca3af; }
+    .guide__body { padding: 20px; }
+    .code {
+      background: #0a0a0a; border: 1px solid #1f1f1f; border-radius: 10px; padding: 16px;
+      overflow: auto; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; line-height: 1.6; color: #d4d4d8;
+    }
+    .code small { color: #71717a; }
+    pre { margin: 0; }
+    .kbd-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    .kbd-table th { text-align: left; font-weight: 700; color: #fff; padding: 10px 12px; border-bottom: 1px solid #1f1f1f; background: #111; }
+    .kbd-table td { padding: 10px 12px; border-bottom: 1px solid #161616; color: #d4d4d8; }
+    .kbd { background: #1e1e1e; border: 1px solid #2a2a2a; border-bottom-width: 2px; padding: 2px 6px; border-radius: 6px; font-family: ui-monospace, monospace; font-size: 11px; font-weight: 700; }
+    @media (max-width: 900px) { .features { grid-template-columns: 1fr; } }
+    footer { max-width: 1280px; margin: 32px auto; padding: 20px 16px; border-top: 1px solid #1f1f1f; color: #71717a; font-size: 12.5px; text-align: center; }
+  </style>
+</head>
+<body>
+
+  <!-- Top bar -->
+  <header class="topbar">
+    <div class="topbar__inner">
+      <div class="brand">
+        <div class="brand__logo">▶</div>
+        <div>
+          <div class="brand__name">Otip Player</div>
+          <div class="brand__sub">Modern HTML5 Video UI • Dark • Responsive</div>
+        </div>
+      </div>
+      <div class="topbar__actions">
+        <a class="btn" href="#integration">Integration guide</a>
+        <a class="btn btn--primary" href="#player">View demo</a>
+      </div>
+    </div>
+  </header>
+
+  <!-- Hero -->
+  <section class="hero">
+    <h1>Professional video player <span>without compromises</span></h1>
+    <p>
+      Custom HTML5 <code>&lt;video&gt;</code> controls built with vanilla HTML/CSS/JS. Works everywhere — desktop, mobile, React, Laravel Blade. No dependencies, fully keyboard accessible and touch-ready.
+    </p>
+    <div class="hero__badges">
+      <span class="badge badge--accent">Vanilla JS</span>
+      <span class="badge">HTML5 Video API</span>
+      <span class="badge">Fullscreen + PiP</span>
+      <span class="badge">Captions &amp; Speed</span>
+      <span class="badge">Playlist + Chapters</span>
+      <span class="badge">Accessible • ARIA</span>
+    </div>
+  </section>
+
+  <!-- Main layout: Player + Playlist -->
+  <div class="mv-layout" id="player">
+    <!-- ===================== PLAYER CONTAINER ===================== -->
+    <!--
+      HTML structure for the player:
+      - .mv-player is the root (requestFullscreen target)
+      - <video> is the core media element (custom controls via JS)
+      - .mv-center-play: central idle button
+      - .mv-tap-zones: invisible left/center/right zones for mobile gestures
+      - .mv-controls: bottom control bar (auto-hides)
+      - .mv-progress: seek bar with buffered and filled parts + tooltip + chapter markers
+      - .mv-bar: row with grouped buttons (play, volume, time, captions, settings, pip, fullscreen)
+      - .mv-menu: popover menus for Settings and Captions
+      - .mv-help: keyboard shortcuts overlay
+    -->
+    <div class="demo-card">
+      <div id="mv-player" class="mv-player" tabindex="0" aria-label="Video player">
+        <!-- Native video element -->
+        <video
+          class="mv-player__video"
+          id="mv-video"
+          poster="https://images.unsplash.com/photo-1485846234645-a62644f84728?w=1200&auto=format&fit=crop&q=60"
+          preload="metadata"
+          playsinline
+          crossorigin="anonymous"
+        >
+          <!-- Example sources: quality simulation handled in JS; native <source> as fallback -->
+          <!-- Tracks are also injected via JS for demo; here is a static example -->
+          <track kind="subtitles" label="English" srclang="en" src="" default>
+          <track kind="subtitles" label="Français" srclang="fr" src="">
+          Your browser does not support the video tag.
+        </video>
+
+        <!-- Loading spinner -->
+        <div class="mv-player__spinner" data-mv="spinner" aria-hidden="true">
+          <div class="mv-spinner" role="status" aria-label="Loading"></div>
+        </div>
+
+        <!-- Center play button (idle state) -->
+        <button class="mv-center-play" data-mv="center-play" aria-label="Play (Space)">
+          <!-- Icon injected by JS; fallback: -->
+          <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5.14v14l11-7-11-7z"/></svg>
+        </button>
+
+        <!-- Tap zones for mobile gestures -->
+        <div class="mv-tap-zones" aria-hidden="true">
+          <div class="mv-tap-zone mv-tap-zone--left" data-mv="tap-left"></div>
+          <div class="mv-tap-zone mv-tap-zone--center" data-mv="tap-center"></div>
+          <div class="mv-tap-zone mv-tap-zone--right" data-mv="tap-right"></div>
+        </div>
+
+        <!-- Double-tap feedback -->
+        <div class="mv-gesture-feedback mv-gesture-feedback--left" data-mv="feedback-left" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M9 8l-5 4 5 4"/><path d="M20 12a8 8 0 11-8-8"/><text x="11.5" y="15.5" font-size="7" font-weight="700" fill="currentColor" stroke="none" text-anchor="middle">10</text></svg>
+          <span>-10s</span>
+        </div>
+        <div class="mv-gesture-feedback mv-gesture-feedback--right" data-mv="feedback-right" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M15 8l5 4-5 4"/><path d="M4 12a8 8 0 108-8"/><text x="12.5" y="15.5" font-size="7" font-weight="700" fill="currentColor" stroke="none" text-anchor="middle">10</text></svg>
+          <span>+10s</span>
+        </div>
+
+        <!-- Custom captions cue overlay (styled fallback) -->
+        <div class="mv-captions-cue" data-mv="captions-cue" aria-live="polite"></div>
+
+        <!-- Help overlay (keyboard shortcuts) -->
+        <div class="mv-help" data-mv="help" aria-hidden="true" role="dialog" aria-label="Keyboard shortcuts">
+          <div class="mv-help__title">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 015.83 1c0 2-3 3-3 3"/><path d="M12 17h.01"/></svg>
+            Keyboard shortcuts
+            <button class="mv-menu__close" data-mv="help-close" aria-label="Close help" style="margin-left:auto;">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18"/><path d="M6 6l12 12"/></svg>
+            </button>
+          </div>
+          <div class="mv-help__grid">
+            <span class="mv-help__key">Space</span><span class="mv-help__desc">Play / Pause</span>
+            <span class="mv-help__key">← / →</span><span class="mv-help__desc">Seek −5s / +5s (Shift: ±10s)</span>
+            <span class="mv-help__key">↑ / ↓</span><span class="mv-help__desc">Volume +5% / −5%</span>
+            <span class="mv-help__key">M</span><span class="mv-help__desc">Mute / Unmute</span>
+            <span class="mv-help__key">F</span><span class="mv-help__desc">Fullscreen</span>
+            <span class="mv-help__key">C</span><span class="mv-help__desc">Captions on/off</span>
+            <span class="mv-help__key">I</span><span class="mv-help__desc">Picture-in-Picture</span>
+            <span class="mv-help__key">L</span><span class="mv-help__desc">Loop toggle</span>
+            <span class="mv-help__key">0–9</span><span class="mv-help__desc">Jump to 0%–90%</span>
+            <span class="mv-help__key">?</span><span class="mv-help__desc">Open this help</span>
+          </div>
+        </div>
+
+        <!-- Controls overlay -->
+        <div class="mv-controls" data-mv="controls">
+          <!-- Progress bar -->
+          <div class="mv-progress-wrap" data-mv="progress-wrap" aria-label="Video progress">
+            <div class="mv-progress" data-mv="progress">
+              <div class="mv-progress__buffered" data-mv="progress-buffered"></div>
+              <div class="mv-progress__filled" data-mv="progress-filled"></div>
+              <!-- Chapter markers injected by JS -->
+            </div>
+            <!-- Time tooltip -->
+            <div class="mv-tooltip" data-mv="tooltip" role="tooltip">
+              <span data-mv="tooltip-time">0:00</span>
+              <span class="mv-tooltip__chapter" data-mv="tooltip-chapter"></span>
+            </div>
+          </div>
+
+          <!-- Buttons bar -->
+          <div class="mv-bar">
+            <div class="mv-bar__left">
+              <!-- Play / Pause (bar) -->
+              <button class="mv-btn" data-mv="play" aria-label="Play (Space)"></button>
+
+              <!-- Previous / Next (playlist) -->
+              <button class="mv-btn mv-btn--small" data-mv="prev" aria-label="Previous video">
+                <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M6 6h2v12H6zM9.5 12L18 6v12l-8.5-6z"/></svg>
+              </button>
+              <button class="mv-btn mv-btn--small" data-mv="next" aria-label="Next video">
+                <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z"/></svg>
+              </button>
+
+              <!-- Volume -->
+              <div class="mv-volume" data-mv="volume-group">
+                <button class="mv-btn mv-btn--small" data-mv="mute" aria-label="Mute (M)"></button>
+                <div class="mv-volume__slider-wrap">
+                  <input class="mv-volume__slider" data-mv="volume" type="range" min="0" max="1" step="0.01" value="1" aria-label="Volume" />
+                </div>
+              </div>
+
+              <!-- Time -->
+              <div class="mv-time" aria-live="off">
+                <span data-mv="time-current">0:00</span>
+                <span class="mv-time__sep">/</span>
+                <span class="mv-time__total" data-mv="time-total">0:00</span>
+              </div>
+            </div>
+
+            <div class="mv-bar__right">
+              <button class="mv-btn mv-btn--small" data-mv="loop" aria-label="Loop" aria-pressed="false" title="Loop">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M17 1l4 4-4 4"/><path d="M3 11V9a4 4 0 014-4h14"/><path d="M7 23l-4-4 4-4"/><path d="M21 13v2a4 4 0 01-4 4H3"/></svg>
+              </button>
+              <button class="mv-btn mv-btn--small" data-mv="captions" aria-label="Captions (C)" aria-pressed="false" title="Captions">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="3" y="6" width="18" height="12" rx="2"/><path d="M7 12a2 2 0 012-2h1"/><path d="M7 12a2 2 0 002 2h1"/><path d="M13 12a2 2 0 012-2h1"/><path d="M13 12a2 2 0 002 2h1"/></svg>
+              </button>
+              <button class="mv-btn mv-btn--small" data-mv="settings" aria-label="Settings" aria-expanded="false" title="Settings">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="12" r="3"/><path d="M12 1v2"/><path d="M12 21v2"/><path d="M4.22 4.22l1.42 1.42"/><path d="M18.36 18.36l1.42 1.42"/><path d="M1 12h2"/><path d="M21 12h2"/><path d="M4.22 19.78l1.42-1.42"/><path d="M18.36 5.64l1.42-1.42"/></svg>
+              </button>
+              <button class="mv-btn mv-btn--small" data-mv="pip" aria-label="Picture-in-Picture (I)" title="Picture-in-Picture">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="3" y="5" width="18" height="14" rx="2"/><rect x="11" y="11" width="8" height="6" rx="1" fill="currentColor" stroke="none"/></svg>
+              </button>
+              <button class="mv-btn mv-btn--small" data-mv="help-btn" aria-label="Keyboard shortcuts (?)" title="Keyboard shortcuts">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 015.83 1c0 2-3 3-3 3"/><path d="M12 17h.01"/></svg>
+              </button>
+              <button class="mv-btn mv-btn--small" data-mv="fullscreen" aria-label="Fullscreen (F)" title="Fullscreen">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M8 3H5a2 2 0 00-2 2v3"/><path d="M16 3h3a2 2 0 012 2v3"/><path d="M8 21H5a2 2 0 01-2-2v-3"/><path d="M16 21h3a2 2 0 002-2v-3"/></svg>
+              </button>
+            </div>
+          </div>
+
+          <!-- Settings menu (gear) -->
+          <div class="mv-menu" data-mv="settings-menu" aria-hidden="true" role="menu"></div>
+
+          <!-- Captions menu -->
+          <div class="mv-menu mv-menu--captions" data-mv="captions-menu" aria-hidden="true" role="menu"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===================== PLAYLIST (optional) ===================== -->
+    <aside class="mv-playlist" data-mv="playlist" aria-label="Playlist">
+      <div class="mv-playlist__header">
+        <div>
+          <div class="mv-playlist__title">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 6h13"/><path d="M8 12h13"/><path d="M8 18h13"/><path d="M3 6h.01"/><path d="M3 12h.01"/><path d="M3 18h.01"/></svg>
+            Up next
+          </div>
+          <div class="mv-playlist__meta" data-mv="playlist-meta">3 videos</div>
+        </div>
+        <label class="mv-playlist__autoplay">
+          <span>Autoplay</span>
+          <input type="checkbox" data-mv="autoplay-toggle" checked aria-label="Autoplay next video" />
+        </label>
+      </div>
+      <div class="mv-playlist__list" data-mv="playlist-list" role="list">
+        <!-- Playlist items injected by JS -->
+      </div>
+    </aside>
+  </div>
+
+  <!-- Feature bullets -->
+  <section class="features" aria-label="Features">
+    <div class="feature">
+      <div class="feature__icon">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="10"/><polygon points="10 8 16 12 10 16 10 8" fill="currentColor" stroke="none"/></svg>
+      </div>
+      <h3>All essential controls</h3>
+      <p>Play/pause (center + bar), progress with buffered &amp; hover tooltip, time, volume + mute, fullscreen, captions, speed &amp; quality.</p>
+    </div>
+    <div class="feature">
+      <div class="feature__icon">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M10 9l6 3-6 3z" fill="currentColor" stroke="none"/></svg>
+      </div>
+      <h3>Advanced UX</h3>
+      <p>Playlist + autoplay, chapter markers, loop, PiP, keyboard shortcuts, mobile double-tap seek, auto-hide, 44px touch targets.</p>
+    </div>
+    <div class="feature">
+      <div class="feature__icon">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M16 21v-2a4 4 0 00-4-4H6a4 4 0 00-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 11l-3 3-1.5-1.5"/></svg>
+      </div>
+      <h3>Accessible &amp; themeable</h3>
+      <p>Keyboard Tab navigation, focus rings, ARIA labels, high contrast dark chrome, CSS variables for accent &amp; radius.</p>
+    </div>
+  </section>
+
+  <!-- Integration guide -->
+  <section class="guide" id="integration" aria-label="Integration guide">
+    <div class="guide__card">
+      <div class="guide__header">
+        <div>
+          <h2>1. Static HTML page (simplest)</h2>
+          <p>Copy the player HTML skeleton, add CSS &amp; JS, initialize with one line.</p>
+        </div>
+      </div>
+      <div class="guide__body">
+        <div class="code"><pre><span style="color:#6b7280;">&lt;!-- In &lt;head&gt; --&gt;</span>
+<span style="color:#38bdf8;">&lt;link</span> <span style="color:#a5b4fc;">rel</span>=<span style="color:#86efac;">"stylesheet"</span> <span style="color:#a5b4fc;">href</span>=<span style="color:#86efac;">"css/player.css"</span><span style="color:#38bdf8;">&gt;</span>
+
+<span style="color:#6b7280;">&lt;!-- In &lt;body&gt;: copy the #mv-player block from this file (keep data-mv attributes) --&gt;</span>
+<span style="color:#38bdf8;">&lt;div</span> <span style="color:#a5b4fc;">id</span>=<span style="color:#86efac;">"mv-player"</span> <span style="color:#a5b4fc;">class</span>=<span style="color:#86efac;">"mv-player"</span><span style="color:#38bdf8;">&gt;</span>
+  <span style="color:#38bdf8;">&lt;video</span> <span style="color:#a5b4fc;">class</span>=<span style="color:#86efac;">"mv-player__video"</span> <span style="color:#a5b4fc;">poster</span>=<span style="color:#86efac;">"poster.jpg"</span> <span style="color:#a5b4fc;">playsinline</span><span style="color:#38bdf8;">&gt;&lt;/video&gt;</span>
+  <span style="color:#6b7280;">&lt;!-- ... controls markup as in index.html ... --&gt;</span>
+<span style="color:#38bdf8;">&lt;/div&gt;</span>
+
+<span style="color:#6b7280;">&lt;!-- Before &lt;/body&gt; --&gt;</span>
+<span style="color:#38bdf8;">&lt;script</span> <span style="color:#a5b4fc;">src</span>=<span style="color:#86efac;">"js/player.js"</span><span style="color:#38bdf8;">&gt;&lt;/script&gt;</span>
+<span style="color:#38bdf8;">&lt;script&gt;</span>
+  <span style="color:#f472b6;">const</span> player = <span style="color:#f472b6;">new</span> <span style="color:#facc15;">ModernVideoPlayer</span>(<span style="color:#93c5fd;">document</span>.<span style="color:#93c5fd;">querySelector</span>(<span style="color:#86efac;">'#mv-player'</span>), {
+    <span style="color:#a5b4fc;">src</span>: <span style="color:#86efac;">'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4'</span>,
+    <span style="color:#a5b4fc;">poster</span>: <span style="color:#86efac;">'poster.jpg'</span>,
+    <span style="color:#a5b4fc;">tracks</span>: [{ <span style="color:#a5b4fc;">label</span>: <span style="color:#86efac;">'English'</span>, <span style="color:#a5b4fc;">lang</span>: <span style="color:#86efac;">'en'</span>, <span style="color:#a5b4fc;">src</span>: <span style="color:#86efac;">'captions-en.vtt'</span>, <span style="color:#a5b4fc;">default</span>: <span style="color:#f472b6;">true</span> }],
+    <span style="color:#a5b4fc;">chapters</span>: [{ <span style="color:#a5b4fc;">time</span>: <span style="color:#facc15;">0</span>, <span style="color:#a5b4fc;">title</span>: <span style="color:#86efac;">'Intro'</span> }, { <span style="color:#a5b4fc;">time</span>: <span style="color:#facc15;">42</span>, <span style="color:#a5b4fc;">title</span>: <span style="color:#86efac;">'Chapter 1'</span> }],
+    <span style="color:#a5b4fc;">qualities</span>: [
+      { <span style="color:#a5b4fc;">label</span>: <span style="color:#86efac;">'1080p'</span>, <span style="color:#a5b4fc;">src</span>: <span style="color:#86efac;">'video-1080.mp4'</span> },
+      { <span style="color:#a5b4fc;">label</span>: <span style="color:#86efac;">'720p'</span>, <span style="color:#a5b4fc;">src</span>: <span style="color:#86efac;">'video-720.mp4'</span>, <span style="color:#a5b4fc;">default</span>: <span style="color:#f472b6;">true</span> }
+    ]
+  });
+<span style="color:#38bdf8;">&lt;/script&gt;</span></pre></div>
+      </div>
+    </div>
+
+    <div class="guide__card">
+      <div class="guide__header">
+        <div>
+          <h2>2. Laravel Blade</h2>
+          <p>Blade component — pass video data from controller.</p>
+        </div>
+      </div>
+      <div class="guide__body">
+        <div class="code"><pre><span style="color:#6b7280;">{{-- resources/views/components/video-player.blade.php --}}</span>
+<span style="color:#a5b4fc;">@props</span>([<span style="color:#86efac;">'src'</span>, <span style="color:#86efac;">'poster'</span> =&gt; <span style="color:#86efac;">null</span>, <span style="color:#86efac;">'tracks'</span> =&gt; []])
+<span style="color:#38bdf8;">&lt;link</span> <span style="color:#a5b4fc;">rel</span>=<span style="color:#86efac;">"stylesheet"</span> <span style="color:#a5b4fc;">href</span>=<span style="color:#86efac;">"{{ asset('css/player.css') }}"</span><span style="color:#38bdf8;">&gt;</span>
+<span style="color:#38bdf8;">&lt;div</span> <span style="color:#a5b4fc;">class</span>=<span style="color:#86efac;">"mv-player"</span> <span style="color:#a5b4fc;">data-mv-auto-init</span> <span style="color:#a5b4fc;">data-options</span>=<span style="color:#86efac;">'{{ json_encode(["src"=&gt;$src,"poster"=&gt;$poster,"tracks"=&gt;$tracks]) }}'</span><span style="color:#38bdf8;">&gt;</span>
+  <span style="color:#6b7280;">&lt;!-- include same inner HTML as demo (video + controls + menus) --&gt;</span>
+  <span style="color:#38bdf8;">&lt;video</span> <span style="color:#a5b4fc;">class</span>=<span style="color:#86efac;">"mv-player__video"</span> <span style="color:#a5b4fc;">poster</span>=<span style="color:#86efac;">"{{ $poster }}"</span><span style="color:#38bdf8;">&gt;&lt;/video&gt;</span>
+  <span style="color:#6b7280;">&lt;!-- ... rest of controls ... --&gt;</span>
+<span style="color:#38bdf8;">&lt;/div&gt;</span>
+<span style="color:#38bdf8;">&lt;script</span> <span style="color:#a5b4fc;">src</span>=<span style="color:#86efac;">"{{ asset('js/player.js') }}"</span><span style="color:#38bdf8;">&gt;&lt;/script&gt;</span>
+
+<span style="color:#6b7280;">{{-- Usage in a Blade view --}}</span>
+<span style="color:#f472b6;">&lt;x-video-player</span> <span style="color:#a5b4fc;">:src</span>=<span style="color:#86efac;">"asset('videos/demo.mp4')"</span> <span style="color:#a5b4fc;">:tracks</span>=<span style="color:#86efac;">"[['label'=&gt;'English','lang'=&gt;'en','src'=&gt;asset('captions/en.vtt')]]"</span> <span style="color:#f472b6;">/&gt;</span></pre></div>
+      </div>
+    </div>
+
+    <div class="guide__card">
+      <div class="guide__header">
+        <div>
+          <h2>3. React (or any SPA)</h2>
+          <p>Wrap the vanilla class in a useEffect.</p>
+        </div>
+      </div>
+      <div class="guide__body">
+        <div class="code"><pre><span style="color:#f472b6;">import</span> { <span style="color:#93c5fd;">useEffect</span>, <span style="color:#93c5fd;">useRef</span> } <span style="color:#f472b6;">from</span> <span style="color:#86efac;">'react'</span>;
+<span style="color:#f472b6;">import</span> <span style="color:#86efac;">'./player.css'</span>;
+
+<span style="color:#f472b6;">export default function</span> <span style="color:#facc15;">VideoPlayer</span>({ <span style="color:#93c5fd;">src, poster, tracks, playlist</span> }) {
+  <span style="color:#f472b6;">const</span> ref = <span style="color:#93c5fd;">useRef</span>(<span style="color:#f472b6;">null</span>);
+  <span style="color:#93c5fd;">useEffect</span>(() =&gt; {
+    <span style="color:#f472b6;">let</span> player;
+    <span style="color:#f472b6;">import</span>(<span style="color:#86efac;">'./player.js'</span>).<span style="color:#93c5fd;">then</span>(() =&gt; {
+      player = <span style="color:#f472b6;">new</span> <span style="color:#facc15;">window.ModernVideoPlayer</span>(ref.<span style="color:#93c5fd;">current</span>, { src, poster, tracks, playlist });
+    });
+    <span style="color:#f472b6;">return</span> () =&gt; player?.<span style="color:#93c5fd;">destroy</span>();
+  }, [src]);
+  <span style="color:#f472b6;">return</span> (
+    <span style="color:#38bdf8;">&lt;div</span> <span style="color:#a5b4fc;">ref</span>={ref} <span style="color:#a5b4fc;">className</span>=<span style="color:#86efac;">"mv-player"</span><span style="color:#38bdf8;">&gt;</span>
+      <span style="color:#6b7280;">{/* copy inner HTML from index.html (video + controls) */}</span>
+      <span style="color:#38bdf8;">&lt;video</span> <span style="color:#a5b4fc;">className</span>=<span style="color:#86efac;">"mv-player__video"</span> <span style="color:#38bdf8;">/&gt;</span>
+    <span style="color:#38bdf8;">&lt;/div&gt;</span>
+  );
+}</pre></div>
+      </div>
+    </div>
+
+    <div class="guide__card">
+      <div class="guide__header">
+        <div>
+          <h2>Keyboard shortcuts &amp; accessibility</h2>
+          <p>All controls are reachable via Tab and operable with Enter/Space. Visible focus rings and ARIA roles are included.</p>
+        </div>
+      </div>
+      <div class="guide__body" style="padding:0;">
+        <table class="kbd-table">
+          <thead><tr><th>Key</th><th>Action</th></tr></thead>
+          <tbody>
+            <tr><td><span class="kbd">Space</span> / <span class="kbd">K</span> / <span class="kbd">Enter</span></td><td>Play / Pause</td></tr>
+            <tr><td><span class="kbd">←</span> <span class="kbd">→</span></td><td>Seek −5s / +5s (hold <span class="kbd">Shift</span> for ±10s)</td></tr>
+            <tr><td><span class="kbd">↑</span> <span class="kbd">↓</span></td><td>Volume +5% / −5%</td></tr>
+            <tr><td><span class="kbd">M</span></td><td>Mute / Unmute</td></tr>
+            <tr><td><span class="kbd">F</span></td><td>Fullscreen</td></tr>
+            <tr><td><span class="kbd">C</span></td><td>Captions toggle</td></tr>
+            <tr><td><span class="kbd">I</span></td><td>Picture-in-Picture</td></tr>
+            <tr><td><span class="kbd">L</span></td><td>Loop</td></tr>
+            <tr><td><span class="kbd">0</span>–<span class="kbd">9</span></td><td>Jump to 0%–90%</td></tr>
+            <tr><td><span class="kbd">?</span></td><td>Show shortcuts help</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    Built with HTML5 &lt;video&gt; API • Fullscreen &amp; PiP APIs • &lt;track&gt; for captions • No dependencies • Dark theme optimized for binge-watching.<br/>
+    Customize accent via <code>--mv-accent</code> CSS variable. All labels, tooltips and code comments are in English.
+  </footer>
+
+  <!-- Player JS -->
+  <script src="js/player.js"></script>
+  <script>
+    // Demo data: create caption VTT blobs so demo works without external files
+    function createVTTBlob(cues) {
+      const vtt = "WEBVTT\n\n" + cues.map((c, i) => `${i+1}\n${c.time} --> ${c.end}\n${c.text}\n`).join("\n");
+      return URL.createObjectURL(new Blob([vtt], { type: "text/vtt" }));
+    }
+
+    const enVTT = createVTTBlob([
+      { time: "00:00:00.000", end: "00:00:04.000", text: "Welcome to the modern video player demo." },
+      { time: "00:00:04.500", end: "00:00:08.000", text: "All controls are custom — no browser defaults." },
+      { time: "00:00:08.500", end: "00:00:12.000", text: "Try keyboard shortcuts: Space, arrows, M, F, C." },
+      { time: "00:00:12.500", end: "00:00:16.000", text: "Captions are rendered from WebVTT tracks." },
+    ]);
+    const frVTT = createVTTBlob([
+      { time: "00:00:00.000", end: "00:00:04.000", text: "Bienvenue sur la démo du lecteur vidéo moderne." },
+      { time: "00:00:04.500", end: "00:00:08.000", text: "Tous les contrôles sont personnalisés." },
+      { time: "00:00:08.500", end: "00:00:12.000", text: "Essayez les raccourcis : Espace, flèches, M, F, C." },
+      { time: "00:00:12.500", end: "00:00:16.000", text: "Les sous-titres viennent de pistes WebVTT." },
+    ]);
+
+    // Playlist with public sample videos (Big Buck Bunny, etc.)
+    const demoPlaylist = [
+      {
+        title: "Big Buck Bunny — Blender Open Movie",
+        subtitle: "Wildlife • 10:34 • Chapters included",
+        src: "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4",
+        poster: "https://images.unsplash.com/photo-1518709268805-4e9042af9f23?w=640&auto=format&fit=crop&q=60",
+        duration: "10:34",
+        tracks: [
+          { label: "English", lang: "en", src: enVTT, default: true },
+          { label: "Français", lang: "fr", src: frVTT }
+        ],
+        qualities: [
+          { label: "1080p", src: "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4" },
+          { label: "720p", src: "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4", default: true },
+          { label: "480p", src: "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4" }
+        ],
+        chapters: [
+          { time: 0, title: "Intro — Meadow" },
+          { time: 32, title: "Forest Chase" },
+          { time: 85, title: "River Adventure" },
+          { time: 150, title: "Final Encounter" },
+          { time: 240, title: "Credits" }
+        ]
+      },
+      {
+        title: "Elephants Dream — First Blender Open Movie",
+        subtitle: "Sci-Fi • 10:54 • Surreal machinery",
+        src: "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ElephantsDream.mp4",
+        poster: "https://images.unsplash.com/photo-1519681393784-d120267933ba?w=640&auto=format&fit=crop&q=60",
+        duration: "10:54",
+        tracks: [
+          { label: "English", lang: "en", src: enVTT }
+        ],
+        qualities: [
+          { label: "720p", src: "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ElephantsDream.mp4", default: true }
+        ],
+        chapters: [
+          { time: 0, title: "Prologue" },
+          { time: 45, title: "The Machine" },
+          { time: 120, title: "Hallway" },
+          { time: 210, title: "Revelation" }
+        ]
+      },
+      {
+        title: "For Bigger Blazes — Outdoor Adventure",
+        subtitle: "Nature • 0:15 • Short & crisp",
+        src: "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4",
+        poster: "https://images.unsplash.com/photo-1507525428034-b723cf961d3e?w=640&auto=format&fit=crop&q=60",
+        duration: "0:15",
+        chapters: [
+          { time: 0, title: "Ignition" },
+          { time: 6, title: "Flame" }
+        ]
+      }
+    ];
+
+    // Initialize the player
+    const player = new ModernVideoPlayer(document.querySelector('#mv-player'), {
+      playlist: demoPlaylist,
+      autoplayNext: true,
+      loop: false,
+      startVolume: 0.9
+    });
+
+    // Expose for console debugging
+    window.player = player;
+  </script>
+</body>
+</html>
