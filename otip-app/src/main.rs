@@ -246,6 +246,14 @@ impl OtipApp {
                 self.video_handle = None;
                 self.controls_visible = true;
                 self.last_mouse_move = Instant::now();
+                // Stop any previous player first: each spawn owns a dedicated
+                // render thread, so leaking the old one would leave two 30fps
+                // producers flooding the channel (UI freeze). `stop()` is a
+                // lock-free channel send — safe on the UI thread.
+                if let Some(old) = self.video_player.take() {
+                    old.stop();
+                }
+                video_player::clear_frame_receiver();
                 // Spawn playbin with appsink in background thread; UI stays responsive
                 let player = VideoPlayerHandle::spawn(path.clone());
                 // Apply current volume to new player
@@ -499,7 +507,9 @@ impl OtipApp {
                 self.video_player = None;
                 self.video_handle = None;
                 // 4. Subscription Cleanup: drop frame receiver so subscription loop can exit without deadlock
-                *video_player::FRAME_RX_GLOBAL.lock().unwrap() = None;
+                // Non-blocking: try_lock-based helper, never stalls the UI thread
+                // waiting on the background render thread.
+                video_player::clear_frame_receiver();
                 tracing::info!("CloseRequested: async shutdown dispatched, exiting immediately");
                 // 3. Immediate Exit: return window close command without waiting for pipeline
                 // Spec requires: iced::window::close(iced::window::Id::MAIN) - immediate Task return
@@ -530,7 +540,9 @@ impl OtipApp {
                 if let Some(player) = self.video_player.clone() {
                     tokio::spawn(async move { player.stop(); });
                 }
-                *video_player::FRAME_RX_GLOBAL.lock().unwrap() = None;
+                // Non-blocking cleanup (see CloseRequested): never block the UI
+                // thread on the render thread's mutex.
+                video_player::clear_frame_receiver();
                 if let Some(id) = self.window_id {
                     return iced::window::close(id);
                 }
@@ -957,27 +969,51 @@ fn subscription(_app: &OtipApp) -> iced::Subscription<Message> {
     let frames = iced::Subscription::run(|| {
         iced::stream::channel::<Message>(32, move |mut out: iced::futures::channel::mpsc::Sender<Message>| async move {
             loop {
-                let (frame, pos_update) = {
-                    let global = video_player::FRAME_RX_GLOBAL.lock().unwrap();
-                    if let Some(rx_arc) = global.as_ref() {
-                        let mut guard = rx_arc.lock().unwrap();
-                        let mut latest_frame: Option<Handle> = None;
-                        let mut latest_pos: Option<(Duration, Duration)> = None;
-                        while let Ok(ev) = guard.try_recv() {
-                            match ev {
-                                PlayerEvent::Frame(h) => latest_frame = Some(h),
-                                PlayerEvent::PositionUpdate { position, duration } => latest_pos = Some((position, duration)),
-                                PlayerEvent::StateChanged(_playing) => {},
-                                PlayerEvent::VolumeChanged(_) => {},
-                                PlayerEvent::Ready { .. } => {},
-                                PlayerEvent::Error(e) => tracing::warn!("PlayerEvent::Error in subscription: {}", e),
+                // ── Non-blocking drain (deadlock fix) ────────────────────
+                // 1. Snapshot the receiver Arc with try_lock and drop the
+                //    global guard IMMEDIATELY — never hold it across an await
+                //    or while taking the inner receiver lock (nested blocking
+                //    locks here stalled both the executor and the UI thread,
+                //    freezing buttons and newly added elements after a moment).
+                // 2. try_lock (not lock) the inner receiver so a contended
+                //    tick is simply skipped instead of blocking the executor.
+                // 3. Drain with a cap, keep only the latest frame/position
+                //    (channel-flooding fix: 30fps producer vs 60fps poller
+                //    must not queue unbounded work), drop the guard, THEN
+                //    await on sends.
+                let rx_arc_opt = video_player::snapshot_frame_receiver();
+                let (frame, pos_update) = if let Some(rx_arc) = rx_arc_opt {
+                    match rx_arc.try_lock() {
+                        Ok(mut guard) => {
+                            let mut latest_frame: Option<Handle> = None;
+                            let mut latest_pos: Option<(Duration, Duration)> = None;
+                            // Cap drained events per tick: the bounded channel
+                            // holds at most MAX_QUEUED_EVENTS, so this always
+                            // fully drains while staying bounded if the
+                            // producer ever outruns us.
+                            for _ in 0..16 {
+                                match guard.try_recv() {
+                                    Ok(ev) => match ev {
+                                        PlayerEvent::Frame(h) => latest_frame = Some(h),
+                                        PlayerEvent::PositionUpdate { position, duration } => latest_pos = Some((position, duration)),
+                                        PlayerEvent::StateChanged(_playing) => {},
+                                        PlayerEvent::VolumeChanged(_) => {},
+                                        PlayerEvent::Ready { .. } => {},
+                                        PlayerEvent::Error(e) => tracing::warn!("PlayerEvent::Error in subscription: {}", e),
+                                    },
+                                    Err(_) => break, // Empty or Disconnected: nothing more to drain
+                                }
                             }
+                            // Guard drops here with latest-only values; anything
+                            // still queued waits for the next 16ms tick.
+                            (latest_frame, latest_pos)
                         }
-                        (latest_frame, latest_pos)
-                    } else {
-                        (None, None)
+                        Err(_) => (None, None), // contended: skip tick, retry in 16ms
                     }
+                } else {
+                    (None, None)
                 };
+                // Guards dropped above — the awaits below hold NO locks.
                 if let Some(h) = frame {
                     if out.send(Message::FrameReady(h)).await.is_err() { break; }
                 }
@@ -1014,9 +1050,12 @@ fn subscription(_app: &OtipApp) -> iced::Subscription<Message> {
             _ => None,
         }
     });
-    // 4. Redraw subscription: trigger UI redraw at ~60fps for video frames
-    let redraw = iced::time::every(Duration::from_millis(16)).map(|_| Message::Noop);
-    iced::Subscription::batch(vec![frames, close_requests, window_opened, tick, events, redraw])
+    // NOTE: no 60fps Noop redraw pump. FrameReady/PositionUpdate messages
+    // already drive re-renders when a new frame actually arrives; a blind
+    // 60Hz Noop forced a full re-render (and 1MB texture upload) every 16ms
+    // even with no new content, saturating the UI thread so buttons and newly
+    // added elements stopped responding — the reported freeze.
+    iced::Subscription::batch(vec![frames, close_requests, window_opened, tick, events])
 }
 
 fn main() -> iced::Result {

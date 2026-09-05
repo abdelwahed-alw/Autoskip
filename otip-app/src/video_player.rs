@@ -16,6 +16,7 @@ use std::os::raw::c_void;
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use iced::widget::image::Handle;
@@ -49,15 +50,101 @@ pub enum PlayerEvent {
 }
 
 /// Global handle for subscription polling - holds Frame + PositionUpdate events
-pub static FRAME_RX_GLOBAL: LazyLock<std::sync::Mutex<Option<Arc<Mutex<mpsc::UnboundedReceiver<PlayerEvent>>>>>> =
+///
+/// Non-blocking access contract (prevents UI-thread deadlock/freeze):
+/// - The async `Subscription` and the Iced UI thread MUST only use `try_lock`
+///   via the helpers below, snapshot what they need into locals, and drop the
+///   guard immediately — never hold it across an `.await` or a long operation.
+/// - The background render thread never locks this mutex for longer than a
+///   `try_lock` either; `try_send` on the bounded channel is lock-free.
+pub static FRAME_RX_GLOBAL: LazyLock<std::sync::Mutex<Option<Arc<Mutex<mpsc::Receiver<PlayerEvent>>>>>> =
     LazyLock::new(|| std::sync::Mutex::new(None));
+
+/// Alias for the shared frame-event receiver.
+pub type FrameRx = Arc<Mutex<mpsc::Receiver<PlayerEvent>>>;
+
+/// Non-blocking snapshot of the global receiver for the async subscription.
+/// Returns `None` when contended — the caller simply retries on the next
+/// poll tick instead of blocking the executor/UI thread.
+pub fn snapshot_frame_receiver() -> Option<FrameRx> {
+    FRAME_RX_GLOBAL.try_lock().ok().and_then(|g| g.clone())
+}
+
+/// Publish a new receiver from the UI thread without blocking frame render.
+/// Retries briefly with yields; falls back to a blocking lock only if the
+/// subscription is momentarily draining (microseconds), so delivery is
+/// guaranteed while the UI stays responsive.
+pub fn publish_frame_receiver(rx: FrameRx) {
+    for _ in 0..100 {
+        if let Ok(mut g) = FRAME_RX_GLOBAL.try_lock() {
+            *g = Some(rx);
+            return;
+        }
+        std::thread::yield_now();
+    }
+    if let Ok(mut g) = FRAME_RX_GLOBAL.lock() {
+        *g = Some(rx);
+    }
+}
+
+/// Clear the global receiver without blocking. Used on close / video switch
+/// so a stale receiver never keeps the subscription draining a dead channel.
+pub fn clear_frame_receiver() {
+    for _ in 0..100 {
+        if let Ok(mut g) = FRAME_RX_GLOBAL.try_lock() {
+            *g = None;
+            return;
+        }
+        std::thread::yield_now();
+    }
+    if let Ok(mut g) = FRAME_RX_GLOBAL.lock() {
+        *g = None;
+    }
+}
+
+/// Backpressure bound: capacity of the frame-event channel (see `spawn`).
+/// The subscription keeps only the latest frame, so any surplus would be
+/// wasted CPU/memory that manifests as UI freeze.
+pub const MAX_QUEUED_EVENTS: usize = 8;
+
+/// Send a control/state event without blocking. Drops the event when the
+/// channel is momentarily full (frames are produced faster than the UI
+/// drains) — the next tick re-sends fresh state, so nothing stale lingers.
+fn send_event(evt_tx: &mpsc::Sender<PlayerEvent>, ev: PlayerEvent) {
+    // try_send never blocks and never grows the queue beyond capacity.
+    let _ = evt_tx.try_send(ev);
+}
+
+/// Send one frame to the UI without blocking or flooding.
+///
+/// - Drops the frame when the channel is already backed up (the subscription
+///   only keeps the newest frame anyway, so sending more just burns CPU and
+///   memory until the UI freezes).
+/// - Updates the legacy `texture_handle` cache with `try_lock` only: if the
+///   UI thread is currently reading it, skip the update instead of blocking
+///   either thread — the next frame overwrites it ~33ms later.
+fn send_frame(
+    evt_tx: &mpsc::Sender<PlayerEvent>,
+    texture_cache: &Arc<Mutex<Option<Handle>>>,
+    handle: Handle,
+) {
+    // Bounded try_send: drops this frame when the UI is behind instead of
+    // queueing unbounded megabytes (the old unbounded flood froze the UI).
+    // The subscription only keeps the newest frame anyway.
+    if evt_tx.try_send(PlayerEvent::Frame(handle.clone())).is_err() {
+        return;
+    }
+    if let Ok(mut cached) = texture_cache.try_lock() {
+        *cached = Some(handle);
+    }
+}
 
 /// Handle to background mpv task - cheap clone for UI.
 /// Software fallback: no wgpu texture, just Handle::from_pixels per frame via Frame channel.
 #[derive(Clone)]
 pub struct VideoPlayerHandle {
     pub cmd_tx: mpsc::UnboundedSender<PlayerCmd>,
-    pub event_rx: Arc<Mutex<mpsc::UnboundedReceiver<PlayerEvent>>>,
+    pub event_rx: Arc<Mutex<mpsc::Receiver<PlayerEvent>>>,
     pub texture_handle: Arc<Mutex<Option<Handle>>>,
     /// Kept for backwards compat (widget expects Option<Arc<Mpv>>), but SW fallback does NOT use it.
     /// New UI should use `video_handle: Handle::from_rgba` via Frame channel, not widget.
@@ -69,7 +156,11 @@ impl VideoPlayerHandle {
     /// Never blocks Iced async executor - CPU copy via Handle::from_pixels is stable.
     pub fn spawn(path: PathBuf) -> Self {
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<PlayerCmd>();
-        let (evt_tx, evt_rx) = mpsc::unbounded_channel::<PlayerEvent>();
+        // Bounded frame-event channel (anti-flooding fix): the old unbounded
+        // channel let 30fps ~1MB frames pile up without limit whenever the UI
+        // stalled, spiralling into a freeze. `try_send` below drops instead of
+        // queueing, so memory stays flat and the UI always gets fresh frames.
+        let (evt_tx, evt_rx) = mpsc::channel::<PlayerEvent>(MAX_QUEUED_EVENTS);
         let path_for_global = path.clone();
 
         let texture_handle: Arc<Mutex<Option<Handle>>> = Arc::new(Mutex::new(None));
@@ -82,8 +173,18 @@ impl VideoPlayerHandle {
 
         let evt_tx_for_thread = evt_tx.clone();
         let texture_handle_for_thread = texture_handle.clone();
+        // Cooperative stop flag: `PlayerCmd::Stop` (or all senders dropped)
+        // sets this so the dedicated thread below actually terminates instead
+        // of leaking one 30fps loop per opened video (channel flooding/freeze).
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let stop_flag_for_thread = stop_flag.clone();
 
-        tokio::task::spawn_blocking(move || {
+        // Dedicated OS thread (NOT tokio spawn_blocking): this loop runs for the
+        // whole video lifetime, so it must not occupy a runtime blocking-pool
+        // slot, and it must never block the Iced UI thread.
+        let spawn_result = std::thread::Builder::new()
+            .name("otip-mpv-sw".into())
+            .spawn(move || {
             // Software render fallback - try real mpv SW, otherwise dummy animation
             // We use std thread loop (not async) for precise 30fps timing and no tokio runtime nesting complexity
             // Dummy flag: if libmpv unavailable or SW context fails, generate test pattern
@@ -142,7 +243,7 @@ impl VideoPlayerHandle {
                         }
                         Err(e) => {
                             warn!("mpv loadfile failed for {:?}: {:?}", path, e);
-                            let _ = evt_tx_for_thread.send(PlayerEvent::Error(format!("loadfile: {:?}", e)));
+                            send_event(&evt_tx_for_thread, PlayerEvent::Error(format!("loadfile: {:?}", e)));
                         }
                     }
 
@@ -150,14 +251,14 @@ impl VideoPlayerHandle {
                 }
                 Err(e) => {
                     warn!("mpv init failed (libmpv unavailable?): {:?} -> dummy animation fallback", e);
-                    let _ = evt_tx_for_thread.send(PlayerEvent::Error(format!("mpv init failed: {:?}", e)));
+                    send_event(&evt_tx_for_thread, PlayerEvent::Error(format!("mpv init failed: {:?}", e)));
                     sw_available = false;
                     render_ctx = ptr::null_mut();
                     mpv_opt = None;
                 }
             }
 
-            let _ = evt_tx_for_thread.send(PlayerEvent::Ready {
+            send_event(&evt_tx_for_thread, PlayerEvent::Ready {
                 duration: Duration::from_secs(120),
                 width: 640,
                 height: 360,
@@ -200,15 +301,18 @@ impl VideoPlayerHandle {
             };
 
             loop {
-                // Drain commands
-                while let Ok(cmd) = cmd_rx.try_recv() {
-                    match cmd {
+                // Drain commands without blocking. Detect sender disconnect so
+                // a dropped handle (no explicit Stop) still ends this thread.
+                let mut stopping = stop_flag_for_thread.load(Ordering::Relaxed);
+                loop {
+                    match cmd_rx.try_recv() {
+                        Ok(cmd) => match cmd {
                         PlayerCmd::TogglePause => {
                             paused = !paused;
                             if let Some(mpv) = &mpv_opt {
                                 let _ = mpv.set_property("pause", paused);
                             }
-                            let _ = evt_tx_for_thread.send(PlayerEvent::StateChanged(!paused));
+                            send_event(&evt_tx_for_thread, PlayerEvent::StateChanged(!paused));
                         }
                         PlayerCmd::Seek(pos) => {
                             let clamped = pos.clamp(0.0, 1.0) as f64;
@@ -229,14 +333,14 @@ impl VideoPlayerHandle {
                             if let Some(mpv) = &mpv_opt {
                                 let _ = mpv.set_property("volume", (volume * 100.0) as f64);
                             }
-                            let _ = evt_tx_for_thread.send(PlayerEvent::VolumeChanged(volume));
+                            send_event(&evt_tx_for_thread, PlayerEvent::VolumeChanged(volume));
                         }
                         PlayerCmd::SetVolumeF64(v) => {
                             volume = (v as f32).clamp(0.0, 1.0);
                             if let Some(mpv) = &mpv_opt {
                                 let _ = mpv.set_property("volume", (volume * 100.0) as f64);
                             }
-                            let _ = evt_tx_for_thread.send(PlayerEvent::VolumeChanged(volume));
+                            send_event(&evt_tx_for_thread, PlayerEvent::VolumeChanged(volume));
                         }
                         PlayerCmd::ToggleMute => {
                             let new_vol = if volume > 0.01 { 0.0 } else { 0.7 };
@@ -244,7 +348,7 @@ impl VideoPlayerHandle {
                             if let Some(mpv) = &mpv_opt {
                                 let _ = mpv.set_property("volume", (volume * 100.0) as f64);
                             }
-                            let _ = evt_tx_for_thread.send(PlayerEvent::VolumeChanged(volume));
+                            send_event(&evt_tx_for_thread, PlayerEvent::VolumeChanged(volume));
                         }
                         PlayerCmd::SetRate(r) => {
                             if let Some(mpv) = &mpv_opt {
@@ -266,9 +370,22 @@ impl VideoPlayerHandle {
                             if let Some(mpv) = &mpv_opt {
                                 let _ = mpv.command("stop", &[]);
                             }
+                            stop_flag_for_thread.store(true, Ordering::Relaxed);
+                            stopping = true;
+                            break;
+                        },
+                        }, // end match cmd
+                        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                            // UI handle dropped without Stop: exit instead of
+                            // spinning forever and flooding a dead channel.
+                            stopping = true;
                             break;
                         }
                     }
+                }
+                if stopping || stop_flag_for_thread.load(Ordering::Relaxed) {
+                    break;
                 }
 
                 if paused {
@@ -337,18 +454,17 @@ impl VideoPlayerHandle {
                                 chunk[3] = 255;
                             }
                             // 4. Handle::from_pixels(width, height, buffer) -> send via PlayerEvent::Frame
-                            // Note: iced 0.14 API is Handle::from_rgba, from_pixels is documented alias
-                            let handle = Handle::from_rgba(width, height, buffer.clone());
+                            // Note: iced 0.14 API is Handle::from_rgba, from_pixels is documented alias.
+                            // Move `buffer` (no clone): the Handle takes ownership, avoiding a
+                            // ~1MB memcpy per frame that starved the UI thread.
                             // Keep string Handle::from_pixels(width, height, buffer) for grep compatibility
-                            let _ = evt_tx_for_thread.send(PlayerEvent::Frame(handle.clone()));
-                            // Also update texture_handle so any legacy widget polling sees it
-                            *texture_handle_for_thread.lock().unwrap() = Some(handle);
+                            let handle = Handle::from_rgba(width, height, buffer);
+                            send_frame(&evt_tx_for_thread, &texture_handle_for_thread, handle);
                             unsafe { libmpv2_sys::mpv_render_context_report_swap(render_ctx); }
                         } else {
                             // Render failed (e.g. no video yet) -> send dummy to keep UI alive
                             let handle = generate_dummy(width, height, frame_counter);
-                            let _ = evt_tx_for_thread.send(PlayerEvent::Frame(handle.clone()));
-                            *texture_handle_for_thread.lock().unwrap() = Some(handle);
+                            send_frame(&evt_tx_for_thread, &texture_handle_for_thread, handle);
                         }
                     }
                 } else {
@@ -357,25 +473,28 @@ impl VideoPlayerHandle {
                     let height = target_h;
                     let handle = generate_dummy(width, height, frame_counter);
                     // Software fallback - send Frame via channel for iced::widget::image(handle)
-                    let _ = evt_tx_for_thread.send(PlayerEvent::Frame(handle.clone()));
-                    *texture_handle_for_thread.lock().unwrap() = Some(handle);
+                    send_frame(&evt_tx_for_thread, &texture_handle_for_thread, handle);
                 }
 
-                // 4b. Send PositionUpdate via same channel (or separate, but we use same evt_tx)
+                // 4b. PositionUpdate at ~10Hz (every 3rd frame is plenty for the
+                // timeline slider). try_send drops when full — the next tick
+                // re-sends fresh state, so the subscription never gets
+                // overwhelmed no matter how far behind it falls.
+                if frame_counter % 3 == 0 {
                 if let Some(mpv) = &mpv_opt {
                     // Try real mpv properties, fallback to simulated time if not yet available
                     let pos = mpv.get_property::<f64>("time-pos").unwrap_or(-1.0);
                     let dur = mpv.get_property::<f64>("duration").unwrap_or(120.0);
                     let dur = if dur < 0.1 || !dur.is_finite() { 120.0 } else { dur };
                     if pos >= 0.0 && pos.is_finite() {
-                        let _ = evt_tx_for_thread.send(PlayerEvent::PositionUpdate {
+                        send_event(&evt_tx_for_thread, PlayerEvent::PositionUpdate {
                             position: Duration::from_secs_f64(pos),
                             duration: Duration::from_secs_f64(dur),
                         });
                     } else {
                         // Simulate position based on frame_counter for UI timeline
                         let simulated = Duration::from_secs_f64((frame_counter as f64 * 0.033) % dur);
-                        let _ = evt_tx_for_thread.send(PlayerEvent::PositionUpdate {
+                        send_event(&evt_tx_for_thread, PlayerEvent::PositionUpdate {
                             position: simulated,
                             duration: Duration::from_secs_f64(dur),
                         });
@@ -384,8 +503,9 @@ impl VideoPlayerHandle {
                     // Dummy position simulation
                     let dur = Duration::from_secs(120);
                     let pos = Duration::from_secs_f64((frame_counter as f64 * 0.033) % 120.0);
-                    let _ = evt_tx_for_thread.send(PlayerEvent::PositionUpdate { position: pos, duration: dur });
+                    send_event(&evt_tx_for_thread, PlayerEvent::PositionUpdate { position: pos, duration: dur });
                 }
+                } // end ~10Hz PositionUpdate gate
 
                 frame_counter = frame_counter.wrapping_add(1);
                 std::thread::sleep(Duration::from_millis(33)); // ~30fps software
@@ -396,13 +516,24 @@ impl VideoPlayerHandle {
                 unsafe { libmpv2_sys::mpv_render_context_free(render_ctx); }
             }
         });
+        match spawn_result {
+            Ok(_join_handle) => {
+                // Detached on purpose: the thread owns its lifetime and exits
+                // via PlayerCmd::Stop / sender disconnect. No join on the UI
+                // thread (joining here would be the freeze we are fixing).
+            }
+            Err(e) => {
+                warn!("failed to spawn mpv render thread: {:?}", e);
+                send_event(&evt_tx, PlayerEvent::Error(format!(
+                    "failed to spawn render thread: {:?}",
+                    e
+                )));
+            }
+        }
 
         let rx_arc = Arc::new(Mutex::new(evt_rx));
-        {
-            let mut global = FRAME_RX_GLOBAL.lock().unwrap();
-            *global = Some(rx_arc.clone());
-            info!("FRAME_RX_GLOBAL (SW fallback) updated for {:?}", path_for_global);
-        }
+        publish_frame_receiver(rx_arc.clone());
+        info!("FRAME_RX_GLOBAL (SW fallback) updated for {:?}", path_for_global);
         Self {
             cmd_tx,
             event_rx: rx_arc,
@@ -448,7 +579,10 @@ impl VideoPlayerHandle {
         let _ = self.cmd_tx.send(PlayerCmd::Stop);
     }
     pub fn texture_view(&self) -> Option<Handle> {
-        self.texture_handle.lock().unwrap().clone()
+        // Non-blocking read: never stall frame render waiting on the
+        // background thread's cache update — return None (keep last frame)
+        // when contended instead of deadlocking the UI.
+        self.texture_handle.try_lock().ok().and_then(|g| g.clone())
     }
 }
 
@@ -491,6 +625,76 @@ pub async fn extract_thumbnails_batch(paths: Vec<PathBuf>) -> Vec<(PathBuf, Hand
         }
     }
     out
+}
+
+#[cfg(test)]
+mod sync_tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn global_receiver_helpers_are_non_blocking() {
+        // Publish -> snapshot -> clear roundtrip without any blocking lock.
+        let (_tx, rx) = mpsc::channel::<PlayerEvent>(MAX_QUEUED_EVENTS);
+        let rx_arc = Arc::new(Mutex::new(rx));
+        publish_frame_receiver(rx_arc.clone());
+
+        let start = Instant::now();
+        let snap = snapshot_frame_receiver();
+        assert!(start.elapsed() < Duration::from_secs(1), "snapshot must not block");
+        assert!(snap.is_some(), "published receiver must be visible");
+
+        // Contended global must yield None quickly, never block.
+        let _held = FRAME_RX_GLOBAL.lock().unwrap();
+        let start = Instant::now();
+        assert!(snapshot_frame_receiver().is_none(), "contended snapshot must skip, not block");
+        assert!(start.elapsed() < Duration::from_secs(1));
+        drop(_held);
+
+        clear_frame_receiver();
+        assert!(snapshot_frame_receiver().is_none());
+    }
+
+    #[test]
+    fn bounded_channel_drops_instead_of_flooding() {
+        // Fill the event channel like a stalled UI would see; try_send must
+        // fail fast (drop) rather than queue unboundedly (the old freeze).
+        let (tx, mut rx) = mpsc::channel::<PlayerEvent>(2);
+        let cache = Arc::new(Mutex::new(None));
+        let frame = || Handle::from_rgba(4, 4, vec![0u8; 4 * 4 * 4]);
+        send_frame(&tx, &cache, frame());
+        send_frame(&tx, &cache, frame());
+        // Channel full: further frames are dropped, never block, never grow.
+        let start = Instant::now();
+        for _ in 0..100 {
+            send_frame(&tx, &cache, frame());
+        }
+        assert!(start.elapsed() < Duration::from_secs(1), "send_frame must not block when full");
+        // Newest data still retrievable; texture cache updated via try_lock.
+        let mut count = 0;
+        while rx.try_recv().is_ok() {
+            count += 1;
+        }
+        assert!(count <= 2, "bounded channel must not accumulate backlog, got {}", count);
+        assert!(cache.try_lock().map(|g| g.is_some()).unwrap_or(false));
+    }
+
+    #[test]
+    fn texture_view_never_blocks_on_contended_cache() {
+        let cache = Arc::new(Mutex::new(Some(Handle::from_rgba(2, 2, vec![255u8; 16]))));
+        let handle = VideoPlayerHandle {
+            cmd_tx: mpsc::unbounded_channel().0,
+            event_rx: Arc::new(Mutex::new(mpsc::channel(1).1)),
+            texture_handle: cache.clone(),
+            mpv: None,
+        };
+        assert!(handle.texture_view().is_some());
+        // Contended cache: returns None immediately instead of deadlocking render.
+        let _held = cache.lock().unwrap();
+        let start = Instant::now();
+        assert!(handle.texture_view().is_none());
+        assert!(start.elapsed() < Duration::from_secs(1), "texture_view must not block");
+    }
 }
 
 // MpvWgpuWidget - deprecated zero-copy stub kept for backwards compat
