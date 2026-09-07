@@ -18,8 +18,46 @@ use iced::widget::image::Handle;
 use otip_core::domain::{PlaybackMode, PlaybackState};
 use otip_core::timeline::format_duration_short;
 use tracing_subscriber::EnvFilter;
-use video_player::{PlayerEvent, VideoPlayerHandle};
+use video_player::{ChapterInfo, PlayerEvent, RenderQuality, SubTrackInfo, VideoPlayerHandle};
 use iced::futures::SinkExt;
+
+/// YouTube/Spotify-style dark palette — single source of truth for UI chrome.
+///
+/// | Role              | Hex     | Usage                              |
+/// |-------------------|---------|------------------------------------|
+/// | Main background   | #121212 | full-screen background             |
+/// | Elevated surface  | #212121 | menus, bars, cards                 |
+/// | Secondary surface | #303030 | buttons, borders, dividers, hover  |
+/// | Primary text      | #FFFFFF | headings, important text           |
+/// | Secondary text    | #AAAAAA | descriptions, secondary text       |
+/// | Accent            | #3EA6FF | play button, progress, active      |
+/// | Alert/error       | #CF6679 | error messages only                |
+///
+/// (Swap `ACCENT` for `#1DB954` │ `(0.1137, 0.7255, 0.3294)` │ for the Spotify-green variant.)
+pub mod palette {
+    use iced::Color;
+
+    pub const BG_MAIN: Color = Color { r: 0.0706, g: 0.0706, b: 0.0706, a: 1.0 }; // #121212
+    pub const BG_ELEVATED: Color = Color { r: 0.1294, g: 0.1294, b: 0.1294, a: 1.0 }; // #212121
+    pub const BG_HOVER: Color = Color { r: 0.1882, g: 0.1882, b: 0.1882, a: 1.0 }; // #303030
+    pub const TEXT_MAIN: Color = Color::WHITE; // #FFFFFF
+    pub const TEXT_DIM: Color = Color { r: 0.6667, g: 0.6667, b: 0.6667, a: 1.0 }; // #AAAAAA
+    pub const ACCENT: Color = Color { r: 0.2431, g: 0.6510, b: 1.0, a: 1.0 }; // #3EA6FF
+    pub const ACCENT_HOVER: Color = Color { r: 0.36, g: 0.72, b: 1.0, a: 1.0 };
+    pub const ACCENT_PRESSED: Color = Color { r: 0.16, g: 0.52, b: 0.92, a: 1.0 };
+    pub const ALERT: Color = Color { r: 0.8118, g: 0.4000, b: 0.4745, a: 1.0 }; // #CF6679
+
+    // Alpha variants (same hues, translucent over the main background).
+    pub const BAR_BG: Color = Color { r: 0.1294, g: 0.1294, b: 0.1294, a: 0.92 }; // elevated control bar
+    pub const PANEL_BG: Color = Color { r: 0.1294, g: 0.1294, b: 0.1294, a: 0.96 }; // popup panels
+    pub const BTN_BG: Color = Color { r: 0.1882, g: 0.1882, b: 0.1882, a: 0.9 }; // buttons
+    pub const BTN_BG_SOFT: Color = Color { r: 0.1882, g: 0.1882, b: 0.1882, a: 0.85 }; // subtle buttons
+    pub const ACCENT_SOFT: Color = Color { r: 0.2431, g: 0.6510, b: 1.0, a: 0.55 }; // buffered strip
+    pub const SCRIM: Color = Color { r: 0.0, g: 0.0, b: 0.0, a: 0.55 }; // overlay scrim
+    pub const DIVIDER: Color = Color { r: 1.0, g: 1.0, b: 1.0, a: 0.10 }; // borders on dark
+    pub const TRACK_BG: Color = Color { r: 1.0, g: 1.0, b: 1.0, a: 0.08 }; // slider/empty track
+    pub const MARKER_IDLE: Color = Color { r: 1.0, g: 1.0, b: 1.0, a: 0.22 }; // inactive chapter marks
+}
 
 // ── State Machine ───────────────────────────────────────────────────
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,13 +76,25 @@ pub enum Message {
     VideoSelected(PathBuf),
     FileSelected(Option<PathBuf>),
     SetPlaybackMode(PlaybackMode),
+    ToggleModeMenu, // three-dot popup with the playback-mode choices
     PlayPause,
+    NextVideo, // play next item in library_videos
+    PrevVideo, // play previous item in library_videos
+    ToggleLoop, // loop current file via VideoPlayerHandle::set_loop
     Seek(f64), // spec: Seek(f64) 0.0..=1.0 normalized -> VideoPlayerHandle::seek
     SeekF64(f64), // alias for f64 seek
     SeekTo(Duration),
     VolumeChanged(f32), // 0.0..=1.0 -> VideoPlayerHandle::set_volume
     SetVolume(f64), // spec: SetVolume(f64) -> VideoPlayerHandle::set_volume_f64
     ToggleMute, // mute toggle -> VideoPlayerHandle::toggle_mute
+    ToggleCaptions, // CC on/off -> VideoPlayerHandle::set_sub_visibility
+    SubtitleSelected(SubtitleOption), // subtitle track choice -> sid + visibility
+    SubTracksLoaded(Vec<SubTrackInfo>), // embedded subtitle tracks from mpv
+    ToggleSettings, // gear menu popup (quality options)
+    QualitySelected(RenderQuality), // SW render target -> VideoPlayerHandle::set_quality
+    ChaptersLoaded(Vec<ChapterInfo>), // embedded chapters from mpv chapter-list
+    CacheUpdate(f64), // demuxer readahead secs -> buffered strip
+    ToggleMini, // mini/PiP mode: small always-on-top window
     SkipForward, // +10s
     SkipBackward, // -10s
     PositionUpdate(Duration, Duration),
@@ -77,6 +127,7 @@ pub struct OtipApp {
     thumbnails: HashMap<PathBuf, Handle>, // in-memory cache + temp file fallback
     selected_video_path: Option<PathBuf>,
     playback_mode: PlaybackMode,
+    mode_menu_open: bool, // three-dot popup with Safe/Instant/Auto-Skip
     is_playing: bool,
     position: Duration,
     duration: Duration,
@@ -92,8 +143,19 @@ pub struct OtipApp {
     is_muted: bool,
     prev_volume: f32,
     playback_speed: f32, // 0.5,1.0,1.5,2.0
+    is_looping: bool, // loop current file (mpv loop-file)
+    show_subs: bool, // captions on/off (mpv sub-visibility)
+    sub_tracks: Vec<SubTrackInfo>, // embedded subtitle tracks for the picker
+    subtitle_options: Vec<SubtitleOption>, // Off + one entry per track
+    selected_subtitle: SubtitleOption, // current picker selection
+    settings_open: bool, // gear menu popup visible
+    render_quality: RenderQuality, // SW render target (Quality menu)
+    chapters: Vec<ChapterInfo>, // embedded chapters, jumpable from seek bar
+    buffered_ahead_secs: f64, // demuxer cache ahead of playhead (buffered strip)
+    is_mini: bool, // mini/PiP mode: small always-on-top window
     is_fullscreen: bool,
     window_id: Option<window::Id>,
+    status_is_error: bool, // status line shown in alert color when true
 }
 
 impl OtipApp {
@@ -106,6 +168,7 @@ impl OtipApp {
                 thumbnails: HashMap::new(),
                 selected_video_path: None,
                 playback_mode: PlaybackMode::SafeMode,
+                mode_menu_open: false,
                 is_playing: false,
                 position: Duration::ZERO,
                 duration: Duration::ZERO,
@@ -118,7 +181,18 @@ impl OtipApp {
                 is_muted: false,
                 prev_volume: 0.7,
                 playback_speed: 1.0,
+                is_looping: false,
+                show_subs: true, // matches mpv sub-visibility default (auto)
+                sub_tracks: Vec::new(),
+                subtitle_options: vec![SubtitleOption::Off],
+                selected_subtitle: SubtitleOption::Off,
+                settings_open: false,
+                render_quality: RenderQuality::P360, // SW default: cheap on CPU
+                chapters: Vec::new(),
+                buffered_ahead_secs: 0.0,
+                is_mini: false,
                 is_fullscreen: false,
+                status_is_error: false,
                 video_handle: None,
                 window_id: None,
             },
@@ -140,6 +214,20 @@ impl OtipApp {
         }
     }
 
+    /// Neighbor of the currently playing video inside `library_videos`.
+    /// `delta = +1` → next, `-1` → previous. `None` at the boundaries
+    /// (or when nothing is selected), so the buttons safely no-op there.
+    fn neighbor_video(&self, delta: isize) -> Option<PathBuf> {
+        let current = self.selected_video_path.as_ref()?;
+        let idx = self.library_videos.iter().position(|p| p == current)?;
+        let next = idx as isize + delta;
+        if next < 0 || next as usize >= self.library_videos.len() {
+            None
+        } else {
+            Some(self.library_videos[next as usize].clone())
+        }
+    }
+
     fn update(&mut self, msg: Message) -> Task<Message> {
         match msg {
             Message::NavigateTo(screen) => {
@@ -157,6 +245,7 @@ impl OtipApp {
                 } else {
                     format!("Auto-discovered {} videos", self.library_videos.len())
                 };
+                self.status_is_error = false;
                 tracing::info!("LibraryScanned: {} videos -> UI refresh", self.library_videos.len());
                 // 2. Async Thumbnails: render placeholders immediately, load each thumbnail async via per-video Tasks
                 if !videos.is_empty() {
@@ -201,6 +290,7 @@ impl OtipApp {
                                 .collect();
                             videos.sort();
                             self.status = format!("Found {} videos in {}", videos.len(), folder.display());
+                            self.status_is_error = false;
                             // State Update: set videos first so grid renders placeholders instantly
                             self.library_videos = videos.clone();
                             tracing::info!("FolderSelected: {} videos -> UI refresh", self.library_videos.len());
@@ -217,6 +307,7 @@ impl OtipApp {
                         }
                         Err(e) => {
                             self.status = format!("Failed to read folder: {}", e);
+                            self.status_is_error = true;
                             self.library_videos.clear();
                         }
                     }
@@ -256,10 +347,23 @@ impl OtipApp {
                 video_player::clear_frame_receiver();
                 // Spawn playbin with appsink in background thread; UI stays responsive
                 let player = VideoPlayerHandle::spawn(path.clone());
-                // Apply current volume to new player
+                // Apply current UI state to the new player (volume/loop/speed
+                // otherwise reset to backend defaults on every video switch).
                 player.set_volume(self.volume);
+                player.set_loop(self.is_looping);
+                player.set_rate(self.playback_speed);
+                player.set_sub_visibility(self.show_subs);
+                player.set_quality(self.render_quality);
+                // Fresh file: drop stale chapters/buffered/subtitle state until
+                // the new render thread reports its own.
+                self.chapters.clear();
+                self.buffered_ahead_secs = 0.0;
+                self.sub_tracks.clear();
+                self.subtitle_options = vec![SubtitleOption::Off];
+                self.selected_subtitle = SubtitleOption::Off;
                 self.video_player = Some(player);
                 self.status = format!("Loading: {}", path.display());
+                self.status_is_error = false;
                 tracing::info!("VideoSelected {:?} with mode {} → Player", path, self.playback_mode);
                 Task::none()
             }
@@ -271,7 +375,15 @@ impl OtipApp {
             }
             Message::SetPlaybackMode(mode) => {
                 self.playback_mode = mode;
+                // Choosing from the three-dot menu dismisses it.
+                self.mode_menu_open = false;
                 tracing::info!("Playback mode set to {}", mode);
+                Task::none()
+            }
+            Message::ToggleModeMenu => {
+                self.mode_menu_open = !self.mode_menu_open;
+                self.last_mouse_move = Instant::now();
+                self.controls_visible = true;
                 Task::none()
             }
             Message::PlayPause => {
@@ -280,6 +392,145 @@ impl OtipApp {
                     p.toggle_pause();
                 }
                 Task::none()
+            }
+            Message::NextVideo => {
+                self.last_mouse_move = Instant::now();
+                self.controls_visible = true;
+                // Reuse VideoSelected so the old player is stopped, the frame
+                // receiver is cleared, and loop/speed are re-applied.
+                if let Some(next) = self.neighbor_video(1) {
+                    return self.update(Message::VideoSelected(next));
+                }
+                Task::none()
+            }
+            Message::PrevVideo => {
+                self.last_mouse_move = Instant::now();
+                self.controls_visible = true;
+                if let Some(prev) = self.neighbor_video(-1) {
+                    return self.update(Message::VideoSelected(prev));
+                }
+                Task::none()
+            }
+            Message::ToggleLoop => {
+                self.is_looping = !self.is_looping;
+                self.last_mouse_move = Instant::now();
+                self.controls_visible = true;
+                if let Some(p) = &self.video_player {
+                    p.set_loop(self.is_looping);
+                }
+                Task::none()
+            }
+            Message::ToggleCaptions => {
+                self.show_subs = !self.show_subs;
+                self.last_mouse_move = Instant::now();
+                self.controls_visible = true;
+                if self.show_subs {
+                    // Turning captions on with "Off" selected picks the first
+                    // embedded track (if any) so something actually shows.
+                    if self.selected_subtitle == SubtitleOption::Off {
+                        if let Some(first) = self.subtitle_options.iter().skip(1).next().cloned() {
+                            self.selected_subtitle = first;
+                        }
+                    }
+                }
+                if let Some(p) = &self.video_player {
+                    p.set_sub_visibility(self.show_subs);
+                    if self.show_subs {
+                        if let SubtitleOption::Track { id, .. } = &self.selected_subtitle {
+                            p.set_sub_track(*id);
+                        }
+                    }
+                }
+                Task::none()
+            }
+            Message::SubTracksLoaded(tracks) => {
+                // Sent once per file by the render thread (only when the file
+                // actually contains subtitle tracks).
+                self.sub_tracks = tracks;
+                self.subtitle_options = build_subtitle_options(&self.sub_tracks);
+                // Mirror mpv's auto-select: captions on + nothing chosen yet
+                // picks the first track so the CC button does something.
+                if self.show_subs && self.selected_subtitle == SubtitleOption::Off {
+                    if let Some(first) = self.subtitle_options.iter().skip(1).next().cloned() {
+                        self.selected_subtitle = first.clone();
+                        if let (Some(p), SubtitleOption::Track { id, .. }) =
+                            (&self.video_player, &first)
+                        {
+                            p.set_sub_visibility(true);
+                            p.set_sub_track(*id);
+                        }
+                    }
+                }
+                Task::none()
+            }
+            Message::SubtitleSelected(choice) => {
+                self.selected_subtitle = choice.clone();
+                self.last_mouse_move = Instant::now();
+                self.controls_visible = true;
+                match &choice {
+                    SubtitleOption::Off => {
+                        self.show_subs = false;
+                        if let Some(p) = &self.video_player {
+                            p.set_sub_visibility(false);
+                        }
+                    }
+                    SubtitleOption::Track { id, .. } => {
+                        self.show_subs = true;
+                        if let Some(p) = &self.video_player {
+                            p.set_sub_visibility(true);
+                            p.set_sub_track(*id);
+                        }
+                    }
+                }
+                Task::none()
+            }
+            Message::ToggleSettings => {
+                self.settings_open = !self.settings_open;
+                self.last_mouse_move = Instant::now();
+                self.controls_visible = true;
+                Task::none()
+            }
+            Message::QualitySelected(q) => {
+                self.render_quality = q;
+                self.last_mouse_move = Instant::now();
+                self.controls_visible = true;
+                if let Some(p) = &self.video_player {
+                    p.set_quality(q);
+                }
+                Task::none()
+            }
+            Message::ChaptersLoaded(chapters) => {
+                // Sent once per file by the render thread (empty = no markers).
+                self.chapters = chapters;
+                Task::none()
+            }
+            Message::CacheUpdate(readahead_secs) => {
+                if readahead_secs.is_finite() && readahead_secs >= 0.0 {
+                    self.buffered_ahead_secs = readahead_secs;
+                }
+                Task::none()
+            }
+            Message::ToggleMini => {
+                // Desktop mini/PiP approximation: Iced has no web-style PiP
+                // overlay, so shrink to a small always-on-top window instead.
+                self.is_mini = !self.is_mini;
+                self.last_mouse_move = Instant::now();
+                self.controls_visible = true;
+                let (level, size) = if self.is_mini {
+                    (window::Level::AlwaysOnTop, iced::Size::new(480.0, 270.0))
+                } else {
+                    (window::Level::Normal, iced::Size::new(1280.0, 720.0))
+                };
+                if let Some(id) = self.window_id {
+                    return Task::batch(vec![
+                        window::set_level(id, level),
+                        window::resize(id, size),
+                    ]);
+                }
+                return Task::batch(vec![
+                    window::set_level(iced::window::Id::unique(), level),
+                    window::resize(iced::window::Id::unique(), size),
+                ]);
             }
             Message::Seek(pos) => {
                 // spec: Seek(f64) 0.0..=1.0 -> VideoPlayerHandle::seek
@@ -361,9 +612,11 @@ impl OtipApp {
                 self.last_mouse_move = Instant::now();
                 self.controls_visible = true;
                 if let Some(p) = &self.video_player {
+                    // Single deterministic command: the UI-computed new_vol is
+                    // authoritative. Do NOT also send toggle_mute() — the
+                    // backend would apply it after set_volume and flip the
+                    // volume back (mute left mpv at 0.7, unmute left it at 0.0).
                     p.set_volume(new_vol);
-                    // also via toggle_mute cmd
-                    p.toggle_mute();
                 }
                 Task::none()
             }
@@ -494,6 +747,7 @@ impl OtipApp {
             }
             Message::MpvError(e) => {
                 self.status = format!("MPV error: {}", e);
+                self.status_is_error = true;
                 Task::none()
             }
             Message::CloseRequested => {
@@ -580,25 +834,25 @@ impl OtipApp {
         // This Row provides our own window controls; OS decorations are hidden via decorations:false
         container(
             row![
-                text(self.title()).size(12).color(Color::from_rgb(0.85, 0.85, 0.88)),
+                text(self.title()).size(12).color(palette::TEXT_MAIN),
                 Space::new().width(Length::Fill),
                 // Custom window controls: minimize, maximize, close
-                button(text("—").size(12).color(Color::from_rgb(0.7, 0.7, 0.75)))
+                button(text("—").size(12).color(palette::TEXT_MAIN))
                     .padding([2, 8])
                     .style(|_: &Theme, _| button::Style {
                         background: Some(Background::Color(Color::TRANSPARENT)),
                         border: Border::default(),
-                        text_color: Color::from_rgb(0.7, 0.7, 0.75),
+                        text_color: palette::TEXT_MAIN,
                         shadow: Shadow::default(),
                         snap: false
                     })
                     .on_press(Message::MinimizeWindow),
-                button(text("□").size(12).color(Color::from_rgb(0.7, 0.7, 0.75)))
+                button(text("□").size(12).color(palette::TEXT_MAIN))
                     .padding([2, 8])
                     .style(|_: &Theme, _| button::Style {
                         background: Some(Background::Color(Color::TRANSPARENT)),
                         border: Border::default(),
-                        text_color: Color::from_rgb(0.7, 0.7, 0.75),
+                        text_color: palette::TEXT_MAIN,
                         shadow: Shadow::default(),
                         snap: false
                     })
@@ -624,9 +878,9 @@ impl OtipApp {
         .height(Length::Fixed(30.0))
         .padding([2, 8])
         .style(|_: &Theme| container::Style {
-            background: Some(Background::Color(Color::from_rgb(0.14, 0.14, 0.17))),
+            background: Some(Background::Color(palette::BG_ELEVATED)),
             border: Border {
-                color: Color::from_rgb(0.22, 0.22, 0.26),
+                color: palette::BG_HOVER,
                 width: 1.0,
                 radius: 0.0.into(),
             },
@@ -649,11 +903,11 @@ impl OtipApp {
             .width(Length::Fill)
             .height(Length::Fill)
             .padding(20)
-            .style(|t: &Theme| container::Style {
-                background: Some(Background::Color(t.palette().background)),
+            .style(|_: &Theme| container::Style {
+                background: Some(Background::Color(palette::BG_MAIN)),
                 border: Border::default(),
                 shadow: Shadow::default(),
-                text_color: Some(t.palette().text),
+                text_color: Some(palette::TEXT_MAIN),
                 snap: false,
             })
             .into();
@@ -665,26 +919,26 @@ impl OtipApp {
 
     fn view_splash(&self) -> Element<Message> {
         let title = column![
-            text("Otip").size(64).color(Color::from_rgb(0.2, 0.6, 0.9)),
-            text("AI-Powered Lookahead Content Moderator").size(18).color(Color::from_rgb(0.7, 0.7, 0.75)),
+            text("Otip").size(64).color(palette::ACCENT),
+            text("AI-Powered Lookahead Content Moderator").size(18).color(palette::TEXT_MAIN),
             Space::new().height(Length::Fixed(8.0)),
-            text("Scans upcoming scenes • Skips explicit content • Zero file modification").size(12).color(Color::from_rgb(0.5, 0.5, 0.55)),
+            text("Scans upcoming scenes • Skips explicit content • Zero file modification").size(12).color(palette::TEXT_DIM),
         ].align_x(Alignment::Center).spacing(6);
         let cta = button(
             container(text("Browse Videos →").size(16).color(Color::WHITE)).padding(14).center_x(Length::Fill).width(Length::Fixed(220.0)),
         ).on_press(Message::NavigateTo(AppScreen::Library)).padding(0)
             .style(|_: &Theme, s| button::Style {
                 background: Some(Background::Color(match s {
-                    button::Status::Hovered => Color::from_rgb(0.25, 0.65, 0.95),
-                    button::Status::Pressed => Color::from_rgb(0.15, 0.5, 0.85),
-                    _ => Color::from_rgb(0.2, 0.6, 0.9),
+                    button::Status::Hovered => palette::ACCENT_HOVER,
+                    button::Status::Pressed => palette::ACCENT_PRESSED,
+                    _ => palette::ACCENT,
                 })),
                 border: Border { radius: 10.0.into(), ..Default::default() },
                 text_color: Color::WHITE, shadow: Shadow::default(), snap: false,
             });
         container(column![
             Space::new().height(Length::FillPortion(1)), title, Space::new().height(Length::Fixed(32.0)), cta,
-            Space::new().height(Length::FillPortion(1)), text("Safe Mode • Instant Play • Auto-Skip").size(11).color(Color::from_rgb(0.45, 0.45, 0.5)),
+            Space::new().height(Length::FillPortion(1)), text("Safe Mode • Instant Play • Auto-Skip").size(11).color(palette::TEXT_DIM),
         ].align_x(Alignment::Center).spacing(12).width(Length::Fill).height(Length::Fill))
         .width(Length::Fill).height(Length::Fill).center_x(Length::Fill).center_y(Length::Fill).into()
     }
@@ -705,29 +959,30 @@ impl OtipApp {
         let top_bar = row![
             button(text("← Back").size(13)).on_press(Message::NavigateTo(AppScreen::Splash)).padding(8)
                 .style(|t: &Theme, _| button::Style {
-                    background: Some(Background::Color(Color::from_rgba(0.15, 0.15, 0.18, 1.0))),
-                    border: Border { color: Color::from_rgb(0.3, 0.3, 0.35), width: 1.0, radius: 6.0.into() },
+                    background: Some(Background::Color(palette::BG_HOVER)),
+                    border: Border { color: palette::BG_HOVER, width: 1.0, radius: 6.0.into() },
                     text_color: t.palette().text, shadow: Shadow::default(), snap: false
                 }),
             Space::new().width(Length::Fill),
-            text(folder_label).size(12).color(Color::from_rgb(0.6, 0.6, 0.65)),
+            text(folder_label).size(12).color(palette::TEXT_DIM),
             Space::new().width(Length::Fill),
             button(text("📁 Select Folder").size(13).color(Color::WHITE)).on_press(Message::SelectFolder).padding([8, 14])
                 .style(|_: &Theme, _| button::Style {
-                    background: Some(Background::Color(Color::from_rgb(0.2, 0.6, 0.9))),
+                    background: Some(Background::Color(palette::ACCENT)),
                     border: Border { radius: 6.0.into(), ..Default::default() },
                     text_color: Color::WHITE, shadow: Shadow::default(), snap: false
                 }),
         ].align_y(Alignment::Center).spacing(12).width(Length::Fill);
-        let status = text(&self.status).size(11).color(Color::from_rgb(0.5, 0.5, 0.55));
+        let status_color = if self.status_is_error { palette::ALERT } else { palette::TEXT_DIM };
+        let status = text(&self.status).size(11).color(status_color);
 
         // Fix Issue 1: MUST render list/grid when videos is not empty, regardless of selected_folder
         // Only show "No folder selected" / "No videos" when videos is actually empty
         let grid: Element<Message> = if self.library_videos.is_empty() {
             container(column![
-                text("No videos found").size(16).color(Color::from_rgb(0.6, 0.6, 0.65)),
+                text("No videos found").size(16).color(palette::TEXT_DIM),
                 Space::new().height(Length::Fixed(8.0)),
-                text("No folder selected — auto-scan found 0 videos. Pick a folder.").size(12).color(Color::from_rgb(0.5, 0.5, 0.5)),
+                text("No folder selected — auto-scan found 0 videos. Pick a folder.").size(12).color(palette::TEXT_DIM),
             ].align_x(Alignment::Center)).width(Length::Fill).height(Length::Fill).center_x(Length::Fill).center_y(Length::Fill).into()
         } else {
             // Iterate over discovered videos and render inside Scrollable
@@ -749,16 +1004,16 @@ impl OtipApp {
                         container(image(handle.clone()).width(Length::Fixed(160.0)).height(Length::Fixed(90.0)))
                             .width(Length::Fixed(160.0)).height(Length::Fixed(90.0))
                             .style(|_: &Theme| container::Style {
-                                background: Some(Background::Color(Color::from_rgb(0.08, 0.08, 0.10))),
-                                border: Border { color: Color::from_rgb(0.25, 0.25, 0.30), width: 1.0, radius: 6.0.into() },
+                                background: Some(Background::Color(palette::BG_MAIN)),
+                                border: Border { color: palette::BG_HOVER, width: 1.0, radius: 6.0.into() },
                                 shadow: Shadow::default(), text_color: None, snap: false,
                             }).into()
                     } else {
-                        container(text("🎬").size(24).color(Color::from_rgb(0.6,0.6,0.9)))
+                        container(text("🎬").size(24).color(palette::ACCENT))
                             .width(Length::Fixed(160.0)).height(Length::Fixed(90.0)).center_x(Length::Fill).center_y(Length::Fill)
                             .style(|_: &Theme| container::Style {
-                                background: Some(Background::Color(Color::from_rgb(0.14, 0.14, 0.18))),
-                                border: Border { color: Color::from_rgb(0.30, 0.30, 0.35), width: 1.0, radius: 6.0.into() },
+                                background: Some(Background::Color(palette::BG_ELEVATED)),
+                                border: Border { color: palette::BG_HOVER, width: 1.0, radius: 6.0.into() },
                                 shadow: Shadow::default(), text_color: None, snap: false,
                             }).into()
                     };
@@ -767,13 +1022,13 @@ impl OtipApp {
                             thumb,
                             column![
                                 text(name.clone()).size(13).color(Color::WHITE),
-                                text(p.display().to_string()).size(10).color(Color::from_rgb(0.6,0.6,0.65)),
+                                text(p.display().to_string()).size(10).color(palette::TEXT_DIM),
                             ].spacing(4).width(Length::Fill),
                             button(text("▶ Play").size(12).color(Color::WHITE))
                                 .on_press(Message::VideoSelected(p.clone()))
                                 .padding([8, 14])
                                 .style(|_: &Theme, _| button::Style {
-                                    background: Some(Background::Color(Color::from_rgb(0.2, 0.6, 0.9))),
+                                    background: Some(Background::Color(palette::ACCENT)),
                                     border: Border { radius: 6.0.into(), ..Default::default() },
                                     text_color: Color::WHITE, shadow: Shadow::default(), snap: false,
                                 })
@@ -781,8 +1036,8 @@ impl OtipApp {
                     )
                     .width(Length::Fill)
                     .style(|_: &Theme| container::Style {
-                        background: Some(Background::Color(Color::from_rgb(0.16, 0.16, 0.20))),
-                        border: Border { color: Color::from_rgb(0.28,0.28,0.32), width: 1.0, radius: 8.0.into() },
+                        background: Some(Background::Color(palette::BG_ELEVATED)),
+                        border: Border { color: palette::BG_HOVER, width: 1.0, radius: 8.0.into() },
                         shadow: Shadow::default(), text_color: None, snap: false,
                     }).into()
                 })
@@ -805,11 +1060,11 @@ impl OtipApp {
         .width(Length::Fill)
         .height(Length::Fill)
         .padding(16)
-        .style(|t: &Theme| container::Style {
-            background: Some(Background::Color(t.palette().background)),
+        .style(|_: &Theme| container::Style {
+            background: Some(Background::Color(palette::BG_MAIN)),
             border: Border::default(),
             shadow: Shadow::default(),
-            text_color: Some(t.palette().text),
+            text_color: Some(palette::TEXT_MAIN),
             snap: false,
         })
         .into()
@@ -830,21 +1085,96 @@ impl OtipApp {
             container(column![
                 text("▶ No video - select from library").size(18).color(Color::WHITE).align_x(Alignment::Center),
                 Space::new().height(Length::Fixed(8.0)),
-                text(self.selected_video_path.as_ref().and_then(|p| p.file_name()).and_then(|n| n.to_str()).unwrap_or("no file")).size(12).color(Color::from_rgb(0.7,0.7,0.75)),
+                text(self.selected_video_path.as_ref().and_then(|p| p.file_name()).and_then(|n| n.to_str()).unwrap_or("no file")).size(12).color(palette::TEXT_MAIN),
                 Space::new().height(Length::Fixed(8.0)),
-                text(if self.video_player.is_some() { "Loading video (SW fallback)..." } else { "" }).size(11).color(Color::from_rgb(0.5,0.5,0.55)),
+                text(if self.video_player.is_some() { "Loading video (SW fallback)..." } else { "" }).size(11).color(palette::TEXT_DIM),
             ].align_x(Alignment::Center).spacing(4))
             .width(Length::Fill).height(Length::Fill).center_x(Length::Fill).center_y(Length::Fill)
-            .style(|_: &Theme| container::Style{ background: Some(Background::Color(Color::from_rgb(0.04,0.04,0.06))), border: Border{ color: Color::from_rgb(0.18,0.18,0.22), width:1.0, radius:8.0.into()}, shadow: Shadow::default(), text_color: None, snap:false }).into()
+            .style(|_: &Theme| container::Style{ background: Some(Background::Color(palette::BG_MAIN)), border: Border{ color: palette::BG_HOVER, width:1.0, radius:8.0.into()}, shadow: Shadow::default(), text_color: None, snap:false }).into()
         };
 
-        // Top-right overlay: playback options (always accessible)
-        let overlay = container(row![
-            overlay_btn("Safe", PlaybackMode::SafeMode, self.playback_mode == PlaybackMode::SafeMode),
-            overlay_btn("Instant", PlaybackMode::InstantPlay, self.playback_mode == PlaybackMode::InstantPlay),
-            overlay_btn("Auto-Skip", PlaybackMode::AutoSkip, self.playback_mode == PlaybackMode::AutoSkip),
-        ].spacing(6)).padding(8)
-            .style(|_: &Theme| container::Style{ background: Some(Background::Color(Color::from_rgba(0.0,0.0,0.0,0.55))), border: Border{ color: Color::from_rgba(1.0,1.0,1.0,0.1), width:1.0, radius:8.0.into()}, shadow: Shadow::default(), text_color: None, snap:false });
+        // Top-right overlay: three-dot menu holding the playback-mode choices
+        // (Safe / Instant / Auto-Skip). One compact button instead of three.
+        let dots_btn = button(text("⋯").size(15).color(Color::WHITE))
+            .on_press(Message::ToggleModeMenu)
+            .padding([2, 10])
+            .style(move |_: &Theme, _| button::Style {
+                background: Some(Background::Color(if self.mode_menu_open {
+                    palette::ACCENT
+                } else {
+                    palette::BTN_BG
+                })),
+                border: Border { radius: 6.0.into(), ..Default::default() },
+                text_color: Color::WHITE,
+                shadow: Shadow::default(),
+                snap: false,
+            });
+        let mode_choice = |label: &'static str,
+                           hint: &'static str,
+                           mode: PlaybackMode,
+                           current: PlaybackMode|
+         -> Element<Message> {
+            row![
+                overlay_btn(label, mode, current == mode),
+                text(hint)
+                    .size(11)
+                    .color(palette::TEXT_DIM),
+            ]
+            .align_y(Alignment::Center)
+            .spacing(8)
+            .into()
+        };
+        let current_mode = self.playback_mode;
+        let mode_panel: Element<Message> = if self.mode_menu_open {
+            container(column![
+                mode_choice(
+                    "Safe Mode",
+                    "Look ahead, skip sensitive scenes",
+                    PlaybackMode::SafeMode,
+                    current_mode
+                ),
+                mode_choice(
+                    "Instant Play",
+                    "Start right away, no scanning",
+                    PlaybackMode::InstantPlay,
+                    current_mode
+                ),
+                mode_choice(
+                    "Auto-Skip",
+                    "Skip flagged segments automatically",
+                    PlaybackMode::AutoSkip,
+                    current_mode
+                ),
+            ]
+            .spacing(4))
+            .padding(10)
+            .style(|_: &Theme| container::Style {
+                background: Some(Background::Color(palette::PANEL_BG)),
+                border: Border {
+                    color: palette::DIVIDER,
+                    width: 1.0,
+                    radius: 8.0.into(),
+                },
+                shadow: Shadow::default(),
+                text_color: Some(palette::TEXT_MAIN),
+                snap: false,
+            })
+            .into()
+        } else {
+            Space::new().height(Length::Fixed(0.0)).into()
+        };
+        let overlay = container(
+            column![
+                row![
+                    Space::new().width(Length::Fill),
+                    dots_btn,
+                ],
+                mode_panel,
+            ]
+            .spacing(6),
+        )
+        .padding(8)
+            .style(|_: &Theme| container::Style{ background: Some(Background::Color(palette::SCRIM)), border: Border{ color: palette::DIVIDER, width:1.0, radius:8.0.into()}, shadow: Shadow::default(), text_color: None, snap:false });
 
         let stacked_video = stack![
             container(video_area).width(Length::Fill).height(Length::Fill),
@@ -859,55 +1189,174 @@ impl OtipApp {
             PlaybackState::Paused => "▶ Play",
             _ => "▶ Play",
         };
-        // Time Display: Current Time / Total Duration e.g. 01:23 / 15:00
+        // Time Display: Current Time / Total Duration e.g. 01:23 / 15:00,
+        // plus the current embedded chapter title when chapters exist.
         let time_text = format!("{} / {}", format_duration_short(self.position), format_duration_short(self.duration));
+        let time_label = match current_chapter_title(&self.chapters, self.position) {
+            Some(title) => format!("{}  •  {}", time_text, title),
+            None => time_text,
+        };
+
+        // Buffered strip: thin bar above the seek slider showing how far the
+        // demuxer cache reaches ahead (mpv demuxer-cache-duration). For local
+        // files this quickly covers the whole timeline; for streams it shows
+        // real readahead.
+        let buffered_frac = if self.duration.as_secs_f64() > 0.0 {
+            ((self.position.as_secs_f64() + self.buffered_ahead_secs)
+                / self.duration.as_secs_f64())
+            .clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let buffered_filled = (buffered_frac * 1000.0).round() as u16;
+        let buffered_strip: Element<Message> = row![
+            container(Space::new().width(Length::Fill).height(Length::Fixed(3.0)))
+                .width(Length::FillPortion(buffered_filled))
+                .style(|_: &Theme| container::Style {
+                    background: Some(Background::Color(palette::ACCENT_SOFT)),
+                    border: Border { radius: 2.0.into(), ..Default::default() },
+                    shadow: Shadow::default(), text_color: None, snap: false,
+                }),
+            container(Space::new().width(Length::Fill).height(Length::Fixed(3.0)))
+                .width(Length::FillPortion(1000 - buffered_filled))
+                .style(|_: &Theme| container::Style {
+                    background: Some(Background::Color(palette::TRACK_BG)),
+                    border: Border { radius: 2.0.into(), ..Default::default() },
+                    shadow: Shadow::default(), text_color: None, snap: false,
+                }),
+        ]
+        .spacing(0)
+        .into();
+
+        // Chapter markers: clickable segments proportional to each chapter's
+        // length (jump on click via SeekTo). Hidden when the file has no
+        // embedded chapters.
+        let chapter_segments = chapter_segments(&self.chapters, self.duration);
+        let chapter_strip: Element<Message> = if chapter_segments.is_empty() {
+            Space::new().height(Length::Fixed(0.0)).into()
+        } else {
+            let total = self.duration.as_secs_f64().max(0.001);
+            let position = self.position;
+            let segments: Vec<Element<Message>> = chapter_segments
+                .into_iter()
+                .map(|(start, end)| {
+                    let gap = (end - start).as_secs_f64().max(0.0);
+                    let portion = ((gap / total) * 1000.0).round().clamp(1.0, 1000.0) as u16;
+                    let active = position >= start && position < end;
+                    mouse_area(
+                        container(Space::new().width(Length::Fill).height(Length::Fixed(8.0)))
+                            .width(Length::FillPortion(portion))
+                            .style(move |_: &Theme| container::Style {
+                                background: Some(Background::Color(if active {
+                                    palette::ACCENT
+                                } else {
+                                    palette::MARKER_IDLE
+                                })),
+                                border: Border { radius: 4.0.into(), ..Default::default() },
+                                shadow: Shadow::default(), text_color: None, snap: false,
+                            }),
+                    )
+                    .on_press(Message::SeekTo(start))
+                    .into()
+                })
+                .collect();
+            row(segments).spacing(2).into()
+        };
 
         // Progress/Seek Slider: iced::widget::slider spanning width, bound to duration
-        let seek_bar = slider(0.0..=1.0, self.timeline_pos as f64, Message::Seek).step(0.005).width(Length::Fill);
+        let seek_bar = slider(0.0..=1.0, self.timeline_pos as f64, Message::Seek).step(0.005).width(Length::Fill).style(dark_slider_style());
 
         // Volume Controls: mute toggle + slider 0.0..1.0
         let mute_icon = if self.is_muted || self.volume < 0.01 { "🔇" } else if self.volume < 0.5 { "🔉" } else { "🔊" };
         let volume_row = row![
             button(text(mute_icon).size(13)).on_press(Message::ToggleMute).padding([4,8])
-                .style(|_: &Theme, _| button::Style{ background: Some(Background::Color(Color::from_rgba(0.25,0.25,0.30,0.85))), border: Border{ radius:6.0.into(), ..Default::default()}, text_color: Color::WHITE, shadow: Shadow::default(), snap:false }),
-            slider(0.0..=1.0, self.volume as f64, Message::SetVolume).step(0.02).width(Length::Fixed(90.0)),
+                .style(|_: &Theme, _| button::Style{ background: Some(Background::Color(palette::BTN_BG_SOFT)), border: Border{ radius:6.0.into(), ..Default::default()}, text_color: Color::WHITE, shadow: Shadow::default(), snap:false }),
+            slider(0.0..=1.0, self.volume as f64, Message::SetVolume).step(0.02).width(Length::Fixed(90.0)).style(dark_slider_style()),
         ].spacing(6).align_y(Alignment::Center);
 
-        // Playback Speed: cycle button 0.5x,1.0x,1.5x,2.0x
-        let speed_label = format!("{:.1}x", self.playback_speed);
-        let speed_btn = button(text(speed_label).size(11).color(Color::WHITE)).on_press(Message::CycleSpeed).padding([6,10])
-            .style(|_: &Theme, _| button::Style{ background: Some(Background::Color(Color::from_rgba(0.35,0.35,0.40,0.9))), border: Border{ radius:6.0.into(), ..Default::default()}, text_color: Color::WHITE, shadow: Shadow::default(), snap:false });
+        // Playback Speed: dropdown menu via pick_list (dark-theme styled).
+        // Replaces the old static "1.0x" cycle button so every speed is
+        // one click away. Reuses Message::SetSpeed(f32) -> set_rate.
+        let speed_menu = pick_list(
+            &SPEED_OPTIONS[..],
+            Some(speed_label(self.playback_speed)),
+            |label: &'static str| Message::SetSpeed(parse_speed_label(label)),
+        )
+        .placeholder("1.0x")
+        .width(Length::Fixed(88.0))
+        .style(dark_pick_list_style());
+
+        // Loop Toggle: accent background while active (same pattern as the
+        // Safe/Instant/Auto-Skip overlay buttons).
+        let loop_btn = button(text("🔁 Loop").size(11).color(Color::WHITE)).on_press(Message::ToggleLoop).padding([6,10])
+            .style(move |_: &Theme, _| button::Style{
+                background: Some(Background::Color(if self.is_looping { palette::ACCENT } else { palette::BTN_BG })),
+                border: Border{ radius:6.0.into(), ..Default::default()}, text_color: Color::WHITE, shadow: Shadow::default(), snap:false
+            });
 
         // Fullscreen Toggle
         let fs_label = if self.is_fullscreen { "🗗 Exit" } else { "⛶ Full" };
         let fs_btn = button(text(fs_label).size(11)).on_press(Message::ToggleFullscreen).padding([6,10])
-            .style(|_: &Theme, _| button::Style{ background: Some(Background::Color(Color::from_rgba(0.25,0.25,0.30,0.85))), border: Border{ radius:6.0.into(), ..Default::default()}, text_color: Color::WHITE, shadow: Shadow::default(), snap:false });
+            .style(|_: &Theme, _| button::Style{ background: Some(Background::Color(palette::BTN_BG_SOFT)), border: Border{ radius:6.0.into(), ..Default::default()}, text_color: Color::WHITE, shadow: Shadow::default(), snap:false });
+
+        // Captions Toggle: accent background while visible (mpv sub-visibility).
+        let cc_btn = button(text("CC").size(11).color(Color::WHITE)).on_press(Message::ToggleCaptions).padding([6,10])
+            .style(move |_: &Theme, _| button::Style{
+                background: Some(Background::Color(if self.show_subs { palette::ACCENT } else { palette::BTN_BG })),
+                border: Border{ radius:6.0.into(), ..Default::default()}, text_color: Color::WHITE, shadow: Shadow::default(), snap:false
+            });
+
+        // Settings (gear) Toggle: opens the quality popup panel.
+        let settings_btn = button(text("⚙").size(13).color(Color::WHITE)).on_press(Message::ToggleSettings).padding([6,10])
+            .style(move |_: &Theme, _| button::Style{
+                background: Some(Background::Color(if self.settings_open { palette::ACCENT } else { palette::BTN_BG })),
+                border: Border{ radius:6.0.into(), ..Default::default()}, text_color: Color::WHITE, shadow: Shadow::default(), snap:false
+            });
+
+        // Mini/PiP Toggle: desktop approximation (small always-on-top window).
+        let pip_label = if self.is_mini { "❐ Exit" } else { "❐ PiP" };
+        let pip_btn = button(text(pip_label).size(11).color(Color::WHITE)).on_press(Message::ToggleMini).padding([6,10])
+            .style(move |_: &Theme, _| button::Style{
+                background: Some(Background::Color(if self.is_mini { palette::ACCENT } else { palette::BTN_BG_SOFT })),
+                border: Border{ radius:6.0.into(), ..Default::default()}, text_color: Color::WHITE, shadow: Shadow::default(), snap:false
+            });
 
         let controls_row = row![
+            button(text("⏮ Prev").size(11)).on_press(Message::PrevVideo).padding([6,10])
+                .style(|_: &Theme, _| button::Style{ background: Some(Background::Color(palette::BTN_BG)), border: Border{ radius:6.0.into(), ..Default::default()}, text_color: Color::WHITE, shadow: Shadow::default(), snap:false }),
             button(text("⏪ 10s").size(11)).on_press(Message::SkipBackward).padding([6,10])
-                .style(|_: &Theme, _| button::Style{ background: Some(Background::Color(Color::from_rgba(0.3,0.3,0.35,0.9))), border: Border{ radius:6.0.into(), ..Default::default()}, text_color: Color::WHITE, shadow: Shadow::default(), snap:false }),
+                .style(|_: &Theme, _| button::Style{ background: Some(Background::Color(palette::BTN_BG)), border: Border{ radius:6.0.into(), ..Default::default()}, text_color: Color::WHITE, shadow: Shadow::default(), snap:false }),
             button(text(play_pause_label).size(13).color(Color::WHITE))
                 .on_press(Message::PlayPause).padding([8,16])
-                .style(|_: &Theme, _| button::Style{ background: Some(Background::Color(Color::from_rgb(0.2,0.6,0.9))), border: Border{ radius:20.0.into(), ..Default::default()}, text_color: Color::WHITE, shadow: Shadow::default(), snap:false }),
+                .style(|_: &Theme, _| button::Style{ background: Some(Background::Color(palette::ACCENT)), border: Border{ radius:20.0.into(), ..Default::default()}, text_color: Color::WHITE, shadow: Shadow::default(), snap:false }),
             button(text("10s ⏩").size(11)).on_press(Message::SkipForward).padding([6,10])
-                .style(|_: &Theme, _| button::Style{ background: Some(Background::Color(Color::from_rgba(0.3,0.3,0.35,0.9))), border: Border{ radius:6.0.into(), ..Default::default()}, text_color: Color::WHITE, shadow: Shadow::default(), snap:false }),
-            text(time_text).size(12).color(Color::from_rgb(0.9,0.9,0.95)),
+                .style(|_: &Theme, _| button::Style{ background: Some(Background::Color(palette::BTN_BG)), border: Border{ radius:6.0.into(), ..Default::default()}, text_color: Color::WHITE, shadow: Shadow::default(), snap:false }),
+            button(text("Next ⏭").size(11)).on_press(Message::NextVideo).padding([6,10])
+                .style(|_: &Theme, _| button::Style{ background: Some(Background::Color(palette::BTN_BG)), border: Border{ radius:6.0.into(), ..Default::default()}, text_color: Color::WHITE, shadow: Shadow::default(), snap:false }),
+            text(time_label).size(12).color(palette::TEXT_MAIN),
             volume_row,
-            speed_btn,
+            cc_btn,
+            settings_btn,
+            loop_btn,
+            speed_menu,
+            pip_btn,
             fs_btn,
             button(text("← Library").size(11)).on_press(Message::NavigateTo(AppScreen::Library)).padding([6,10])
-                .style(|t: &Theme, _| button::Style{ background: Some(Background::Color(Color::from_rgba(0.15,0.15,0.18,1.0))), border: Border{ color: Color::from_rgb(0.3,0.3,0.35), width:1.0, radius:6.0.into()}, text_color: t.palette().text, shadow: Shadow::default(), snap:false }),
+                .style(|_: &Theme, _| button::Style{ background: Some(Background::Color(palette::BG_HOVER)), border: Border{ color: palette::BG_HOVER, width:1.0, radius:6.0.into()}, text_color: palette::TEXT_MAIN, shadow: Shadow::default(), snap:false }),
         ].align_y(Alignment::Center).spacing(8).width(Length::Fill);
 
         let bottom_bar: Element<Message> = container(column![
+            buffered_strip,
+            Space::new().height(Length::Fixed(4.0)),
+            chapter_strip,
             seek_bar,
             Space::new().height(Length::Fixed(6.0)),
             controls_row,
         ].spacing(6)).width(Length::Fill).padding([12,14])
             .style(|_: &Theme| container::Style{
-                background: Some(Background::Color(Color::from_rgba(0.08,0.08,0.10,0.92))),
-                border: Border{ color: Color::from_rgba(1.0,1.0,1.0,0.08), width:1.0, radius:8.0.into()},
-                shadow: Shadow::default(), text_color: Some(Color::from_rgb(0.9,0.9,0.95)), snap:false
+                background: Some(Background::Color(palette::BAR_BG)),
+                border: Border{ color: palette::TRACK_BG, width:1.0, radius:8.0.into()},
+                shadow: Shadow::default(), text_color: Some(palette::TEXT_MAIN), snap:false
             }).into();
 
         // 2. UX: Auto-Hide Controls - progressive disclosure, hide after 3s mouse inactivity
@@ -918,17 +1367,219 @@ impl OtipApp {
             Space::new().height(Length::Fixed(0.0)).into()
         };
 
-        let player_stack = column![stacked_video, overlay_controls].spacing(0).width(Length::Fill).height(Length::Fill);
+        // Settings popup panel (gear menu): render-quality selector plus
+        // chapter count. Shown above the control bar while open.
+        let chapter_count = self.chapters.len();
+        let sub_hint = if self.sub_tracks.is_empty() {
+            "No embedded subtitles in this file"
+        } else {
+            "Embedded tracks from file"
+        };
+        let settings_panel: Element<Message> = if self.settings_open {
+            container(
+                column![
+                    row![
+                        text("Quality").size(12).color(palette::TEXT_MAIN),
+                        pick_list(
+                            &RenderQuality::ALL[..],
+                            Some(self.render_quality),
+                            Message::QualitySelected,
+                        )
+                        .placeholder("360p")
+                        .width(Length::Fixed(96.0))
+                        .style(dark_pick_list_style()),
+                        text("SW render — higher is sharper, uses more CPU")
+                            .size(11)
+                            .color(palette::TEXT_DIM),
+                        Space::new().width(Length::Fill),
+                        text(if chapter_count == 0 {
+                            "No embedded chapters".to_string()
+                        } else {
+                            format!(
+                                "{} embedded chapter{} (click markers to jump)",
+                                chapter_count,
+                                if chapter_count == 1 { "" } else { "s" }
+                            )
+                        })
+                        .size(11)
+                        .color(palette::TEXT_DIM),
+                    ]
+                    .align_y(Alignment::Center)
+                    .spacing(10),
+                    row![
+                        text("Subtitles").size(12).color(palette::TEXT_MAIN),
+                        pick_list(
+                            &self.subtitle_options[..],
+                            Some(self.selected_subtitle.clone()),
+                            Message::SubtitleSelected,
+                        )
+                        .placeholder("Off")
+                        .width(Length::Fixed(200.0))
+                        .style(dark_pick_list_style()),
+                        text(sub_hint)
+                            .size(11)
+                            .color(palette::TEXT_DIM),
+                    ]
+                    .align_y(Alignment::Center)
+                    .spacing(10),
+                ]
+                .spacing(8),
+            )
+            .width(Length::Fill)
+            .padding([10, 14])
+            .style(|_: &Theme| container::Style {
+                background: Some(Background::Color(palette::PANEL_BG)),
+                border: Border {
+                    color: palette::DIVIDER,
+                    width: 1.0,
+                    radius: 8.0.into(),
+                },
+                shadow: Shadow::default(),
+                text_color: Some(palette::TEXT_MAIN),
+                snap: false,
+            })
+            .into()
+        } else {
+            Space::new().height(Length::Fixed(0.0)).into()
+        };
+
+        let player_stack = column![stacked_video, settings_panel, overlay_controls].spacing(0).width(Length::Fill).height(Length::Fill);
 
         // Wrap entire player in mouse_area to capture mouse movement for auto-hide
         mouse_area(player_stack).on_move(|_| Message::MouseMoved).into()
     }
 }
 
-fn overlay_btn<'a>(label: &'a str, mode: PlaybackMode, active: bool) -> Element<'a, Message> {
-    button(text(label).size(11).align_x(Alignment::Center)).on_press(Message::SetPlaybackMode(mode)).padding([6,10])
+/// Playback-speed options shown in the speed `pick_list` dropdown.
+const SPEED_OPTIONS: [&str; 4] = ["0.5x", "1.0x", "1.5x", "2.0x"];
+
+/// Current speed → dropdown label (nearest option shown as selected).
+fn speed_label(speed: f32) -> &'static str {
+    if (speed - 0.5).abs() < 0.01 {
+        "0.5x"
+    } else if (speed - 1.5).abs() < 0.01 {
+        "1.5x"
+    } else if (speed - 2.0).abs() < 0.01 {
+        "2.0x"
+    } else {
+        "1.0x"
+    }
+}
+
+/// Dropdown label → speed value for `Message::SetSpeed(f32)` -> `set_rate`.
+fn parse_speed_label(label: &str) -> f32 {
+    label
+        .trim_end_matches('x')
+        .parse::<f32>()
+        .unwrap_or(1.0)
+        .clamp(0.25, 4.0)
+}
+
+/// Shared dark-chrome style for dropdown (`pick_list`) controls so the speed
+/// and quality menus match the control-bar buttons.
+fn dark_pick_list_style(
+) -> impl Fn(&Theme, iced::widget::pick_list::Status) -> iced::widget::pick_list::Style {
+    |_: &Theme, _| iced::widget::pick_list::Style {
+        text_color: palette::TEXT_MAIN,
+        placeholder_color: palette::TEXT_DIM,
+        handle_color: palette::TEXT_MAIN,
+        background: Background::Color(palette::BTN_BG),
+        border: Border {
+            radius: 6.0.into(),
+            ..Default::default()
+        },
+    }
+}
+
+/// Shared dark-chrome style for `slider` controls (seek + volume): accent
+/// selected rail and handle, dim unselected track.
+fn dark_slider_style(
+) -> impl Fn(&Theme, iced::widget::slider::Status) -> iced::widget::slider::Style {
+    |_: &Theme, _| iced::widget::slider::Style {
+        rail: iced::widget::slider::Rail {
+            backgrounds: (
+                Background::Color(palette::ACCENT),
+                Background::Color(palette::TRACK_BG),
+            ),
+            width: 4.0,
+            border: Border::default(),
+        },
+        handle: iced::widget::slider::Handle {
+            shape: iced::widget::slider::HandleShape::Circle { radius: 8.0.into() },
+            background: Background::Color(palette::ACCENT),
+            border_width: 0.0,
+            border_color: Color::TRANSPARENT,
+        },
+    }
+}
+
+/// Title of the chapter containing `pos` (chapters sorted by start time).
+fn current_chapter_title(chapters: &[ChapterInfo], pos: Duration) -> Option<&str> {
+    chapters
+        .iter()
+        .filter(|c| c.time <= pos)
+        .next_back()
+        .map(|c| c.title.as_str())
+}
+
+/// Clickable chapter segments `(start, end)` clipped to `duration`.
+/// Empty when there are no chapters (or no duration) — the marker strip
+/// hides itself. Zero-length segments are dropped.
+fn chapter_segments(chapters: &[ChapterInfo], duration: Duration) -> Vec<(Duration, Duration)> {
+    if chapters.is_empty() || duration.is_zero() {
+        return Vec::new();
+    }
+    let mut bounds: Vec<Duration> = chapters.iter().map(|c| c.time.min(duration)).collect();
+    bounds.sort();
+    bounds.dedup();
+    let mut segments = Vec::new();
+    let mut prev = Duration::ZERO;
+    for bound in bounds {
+        if bound > prev {
+            segments.push((prev, bound));
+        }
+        prev = prev.max(bound);
+    }
+    if prev < duration {
+        segments.push((prev, duration));
+    }
+    segments
+}
+
+/// Subtitle picker choice: captions off, or one embedded track by mpv sid.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SubtitleOption {
+    Off,
+    Track { id: i64, label: String },
+}
+
+impl std::fmt::Display for SubtitleOption {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SubtitleOption::Off => f.write_str("Off"),
+            SubtitleOption::Track { label, .. } => f.write_str(label),
+        }
+    }
+}
+
+/// Build picker options from freshly loaded tracks: always `Off` first,
+/// then one labeled entry per track.
+fn build_subtitle_options(tracks: &[SubTrackInfo]) -> Vec<SubtitleOption> {
+    let mut options = vec![SubtitleOption::Off];
+    for track in tracks {
+        let label = if track.lang.is_empty() || track.lang == "und" {
+            track.title.clone()
+        } else {
+            format!("{} [{}]", track.title, track.lang)
+        };
+        options.push(SubtitleOption::Track { id: track.id, label });
+    }
+    options
+}
+
+fn overlay_btn<'a>(label: &'a str, mode: PlaybackMode, active: bool) -> Element<'a, Message> {    button(text(label).size(11).align_x(Alignment::Center)).on_press(Message::SetPlaybackMode(mode)).padding([6,10])
         .style(move |_: &Theme, _| button::Style{
-            background: Some(Background::Color(if active { Color::from_rgb(0.2,0.6,0.9) } else { Color::from_rgba(0.3,0.3,0.35,0.85) })),
+            background: Some(Background::Color(if active { palette::ACCENT } else { palette::BTN_BG })),
             border: Border{ radius:6.0.into(), ..Default::default()}, text_color: Color::WHITE, shadow: Shadow::default(), snap:false,
         }).into()
 }
@@ -982,6 +1633,11 @@ fn subscription(_app: &OtipApp) -> iced::Subscription<Message> {
                 //    must not queue unbounded work), drop the guard, THEN
                 //    await on sends.
                 let rx_arc_opt = video_player::snapshot_frame_receiver();
+                // Latest-only coalescing for every event kind (channel-flood
+                // safe: the producer only ever gets fresher).
+                let mut latest_chapters: Option<Vec<ChapterInfo>> = None;
+                let mut latest_subs: Option<Vec<SubTrackInfo>> = None;
+                let mut latest_cache: Option<f64> = None;
                 let (frame, pos_update) = if let Some(rx_arc) = rx_arc_opt {
                     match rx_arc.try_lock() {
                         Ok(mut guard) => {
@@ -996,6 +1652,9 @@ fn subscription(_app: &OtipApp) -> iced::Subscription<Message> {
                                     Ok(ev) => match ev {
                                         PlayerEvent::Frame(h) => latest_frame = Some(h),
                                         PlayerEvent::PositionUpdate { position, duration } => latest_pos = Some((position, duration)),
+                                        PlayerEvent::Chapters(ch) => latest_chapters = Some(ch),
+                                        PlayerEvent::SubTracks(subs) => latest_subs = Some(subs),
+                                        PlayerEvent::CacheUpdate { readahead_secs } => latest_cache = Some(readahead_secs),
                                         PlayerEvent::StateChanged(_playing) => {},
                                         PlayerEvent::VolumeChanged(_) => {},
                                         PlayerEvent::Ready { .. } => {},
@@ -1016,6 +1675,15 @@ fn subscription(_app: &OtipApp) -> iced::Subscription<Message> {
                 // Guards dropped above — the awaits below hold NO locks.
                 if let Some(h) = frame {
                     if out.send(Message::FrameReady(h)).await.is_err() { break; }
+                }
+                if let Some(chapters) = latest_chapters.take() {
+                    if out.send(Message::ChaptersLoaded(chapters)).await.is_err() { break; }
+                }
+                if let Some(subs) = latest_subs.take() {
+                    if out.send(Message::SubTracksLoaded(subs)).await.is_err() { break; }
+                }
+                if let Some(readahead) = latest_cache.take() {
+                    if out.send(Message::CacheUpdate(readahead)).await.is_err() { break; }
                 }
                 if let Some((pos, dur)) = pos_update {
                     if out.send(Message::PositionUpdate(pos, dur)).await.is_err() { break; }
@@ -1043,6 +1711,9 @@ fn subscription(_app: &OtipApp) -> iced::Subscription<Message> {
                     keyboard::Key::Named(Named::ArrowUp) => Some(Message::VolumeUp),
                     keyboard::Key::Named(Named::ArrowDown) => Some(Message::VolumeDown),
                     keyboard::Key::Character("f") | keyboard::Key::Character("F") => Some(Message::ToggleFullscreen),
+                    keyboard::Key::Character("m") | keyboard::Key::Character("M") => Some(Message::ToggleMute),
+                    keyboard::Key::Character("c") | keyboard::Key::Character("C") => Some(Message::ToggleCaptions),
+                    keyboard::Key::Character("l") | keyboard::Key::Character("L") => Some(Message::ToggleLoop),
                     _ => None,
                 }
             }
@@ -1063,4 +1734,184 @@ fn main() -> iced::Result {
     tracing::info!("Starting Otip — Splash → Library (thumbnails at 5s) → Player (playbin + controls)");
     iced::application(boot, update, view).theme(theme).title(title).subscription(subscription)
         .window(iced::window::Settings{ size: iced::Size::new(1280.0, 720.0), min_size: Some(iced::Size::new(900.0,600.0)), decorations: false, ..Default::default() }).run()
+}
+
+#[cfg(test)]
+mod player_controls_tests {
+    use super::*;
+
+    #[test]
+    fn speed_labels_roundtrip() {
+        for label in SPEED_OPTIONS {
+            let value = parse_speed_label(label);
+            assert_eq!(speed_label(value), label, "label {} must roundtrip", label);
+        }
+        assert!((parse_speed_label("1.5x") - 1.5).abs() < f32::EPSILON);
+        assert!((parse_speed_label("bogus") - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn neighbor_video_navigation() {
+        let (mut app, _) = OtipApp::new();
+        let vids = vec![
+            PathBuf::from("a.mp4"),
+            PathBuf::from("b.mp4"),
+            PathBuf::from("c.mp4"),
+        ];
+        app.library_videos = vids;
+        app.selected_video_path = Some(PathBuf::from("b.mp4"));
+        assert_eq!(app.neighbor_video(1), Some(PathBuf::from("c.mp4")));
+        assert_eq!(app.neighbor_video(-1), Some(PathBuf::from("a.mp4")));
+        // Boundaries no-op instead of panicking.
+        app.selected_video_path = Some(PathBuf::from("c.mp4"));
+        assert_eq!(app.neighbor_video(1), None);
+        app.selected_video_path = Some(PathBuf::from("a.mp4"));
+        assert_eq!(app.neighbor_video(-1), None);
+        // Unknown selection and empty selection no-op.
+        app.selected_video_path = Some(PathBuf::from("z.mp4"));
+        assert_eq!(app.neighbor_video(1), None);
+        app.selected_video_path = None;
+        assert_eq!(app.neighbor_video(1), None);
+        app.library_videos.clear();
+        assert_eq!(app.neighbor_video(1), None);
+    }
+
+    #[test]
+    fn toggle_loop_flips_state() {
+        let (mut app, _) = OtipApp::new();
+        assert!(!app.is_looping);
+        let _ = app.update(Message::ToggleLoop);
+        assert!(app.is_looping);
+        let _ = app.update(Message::ToggleLoop);
+        assert!(!app.is_looping);
+    }
+
+    fn test_chapters() -> Vec<ChapterInfo> {
+        vec![
+            ChapterInfo { title: "Intro".into(), time: Duration::from_secs(0) },
+            ChapterInfo { title: "Middle".into(), time: Duration::from_secs(60) },
+            ChapterInfo { title: "End".into(), time: Duration::from_secs(120) },
+        ]
+    }
+
+    #[test]
+    fn chapter_title_tracks_position() {
+        let chapters = test_chapters();
+        assert_eq!(current_chapter_title(&chapters, Duration::from_secs(0)), Some("Intro"));
+        assert_eq!(current_chapter_title(&chapters, Duration::from_secs(59)), Some("Intro"));
+        assert_eq!(current_chapter_title(&chapters, Duration::from_secs(60)), Some("Middle"));
+        assert_eq!(current_chapter_title(&chapters, Duration::from_secs(999)), Some("End"));
+        assert_eq!(current_chapter_title(&[], Duration::from_secs(10)), None);
+    }
+
+    #[test]
+    fn chapter_segments_cover_duration_without_gaps() {
+        let duration = Duration::from_secs(180);
+        let segments = chapter_segments(&test_chapters(), duration);
+        assert_eq!(segments.len(), 3);
+        assert_eq!(segments[0], (Duration::from_secs(0), Duration::from_secs(60)));
+        assert_eq!(segments[2], (Duration::from_secs(120), duration));
+        // Contiguous: each segment starts where the previous ended.
+        for pair in segments.windows(2) {
+            assert_eq!(pair[0].1, pair[1].0);
+        }
+        // Degenerate input hides the strip instead of breaking layout.
+        assert!(chapter_segments(&[], duration).is_empty());
+        assert!(chapter_segments(&test_chapters(), Duration::ZERO).is_empty());
+    }
+
+    #[test]
+    fn captions_and_settings_toggle() {
+        let (mut app, _) = OtipApp::new();
+        assert!(app.show_subs);
+        let _ = app.update(Message::ToggleCaptions);
+        assert!(!app.show_subs);
+        assert!(!app.settings_open);
+        let _ = app.update(Message::ToggleSettings);
+        assert!(app.settings_open);
+    }
+
+    #[test]
+    fn quality_selection_applies() {
+        use video_player::RenderQuality;
+        let (mut app, _) = OtipApp::new();
+        assert_eq!(app.render_quality, RenderQuality::P360);
+        let _ = app.update(Message::QualitySelected(RenderQuality::P720));
+        assert_eq!(app.render_quality, RenderQuality::P720);
+        assert_eq!(RenderQuality::P720.dimensions(), (1280, 720));
+        assert_eq!(RenderQuality::P540.label(), "540p");
+    }
+
+    fn test_sub_tracks() -> Vec<SubTrackInfo> {
+        vec![
+            SubTrackInfo { id: 1, title: "English".into(), lang: "en".into() },
+            SubTrackInfo { id: 2, title: "Français".into(), lang: "fr".into() },
+        ]
+    }
+
+    #[test]
+    fn subtitle_options_list_tracks_with_off_first() {
+        let options = build_subtitle_options(&test_sub_tracks());
+        assert_eq!(options.len(), 3);
+        assert_eq!(options[0], SubtitleOption::Off);
+        assert_eq!(
+            options[1],
+            SubtitleOption::Track { id: 1, label: "English [en]".into() }
+        );
+        assert_eq!(options[2].to_string(), "Français [fr]");
+        // No tracks: picker is just Off.
+        assert_eq!(build_subtitle_options(&[]), vec![SubtitleOption::Off]);
+    }
+
+    #[test]
+    fn subtitle_selection_drives_cc_state() {
+        let (mut app, _) = OtipApp::new();
+        let _ = app.update(Message::SubTracksLoaded(test_sub_tracks()));
+        // Captions on by default: first track auto-selected (mpv behavior).
+        assert_eq!(
+            app.selected_subtitle,
+            SubtitleOption::Track { id: 1, label: "English [en]".into() }
+        );
+        // Picking Off disables captions.
+        let _ = app.update(Message::SubtitleSelected(SubtitleOption::Off));
+        assert!(!app.show_subs);
+        assert_eq!(app.selected_subtitle, SubtitleOption::Off);
+        // CC toggle back on re-selects the first track.
+        let _ = app.update(Message::ToggleCaptions);
+        assert!(app.show_subs);
+        assert_eq!(
+            app.selected_subtitle,
+            SubtitleOption::Track { id: 1, label: "English [en]".into() }
+        );
+    }
+
+    #[test]
+    fn palette_matches_spec_hex() {
+        // Guard the YouTube/Spotify palette: main #121212, elevated #212121,
+        // secondary #303030, text #FFFFFF/#AAAAAA, accent #3EA6FF, alert #CF6679.
+        fn hex(c: Color) -> (u8, u8, u8) {
+            (
+                (c.r * 255.0).round() as u8,
+                (c.g * 255.0).round() as u8,
+                (c.b * 255.0).round() as u8,
+            )
+        }
+        assert_eq!(hex(palette::BG_MAIN), (0x12, 0x12, 0x12));
+        assert_eq!(hex(palette::BG_ELEVATED), (0x21, 0x21, 0x21));
+        assert_eq!(hex(palette::BG_HOVER), (0x30, 0x30, 0x30));
+        assert_eq!(hex(palette::TEXT_MAIN), (0xFF, 0xFF, 0xFF));
+        assert_eq!(hex(palette::TEXT_DIM), (0xAA, 0xAA, 0xAA));
+        assert_eq!(hex(palette::ACCENT), (0x3E, 0xA6, 0xFF));
+        assert_eq!(hex(palette::ALERT), (0xCF, 0x66, 0x79));
+    }
+
+    #[test]
+    fn mode_menu_opens_and_closes_on_select() {        let (mut app, _) = OtipApp::new();
+        assert!(!app.mode_menu_open);
+        let _ = app.update(Message::ToggleModeMenu);
+        assert!(app.mode_menu_open);
+        let _ = app.update(Message::SetPlaybackMode(PlaybackMode::AutoSkip));
+        assert_eq!(app.playback_mode, PlaybackMode::AutoSkip);
+        assert!(!app.mode_menu_open);
+    }
 }

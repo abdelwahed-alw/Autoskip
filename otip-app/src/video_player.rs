@@ -36,6 +36,10 @@ pub enum PlayerCmd {
     SetVolumeF64(f64),
     ToggleMute,
     SetRate(f32), // 0.5,1.0,1.5,2.0 via mpv speed property
+    SetLoop(bool), // loop current file via mpv loop-file (inf/no)
+    SetSubVisibility(bool), // captions on/off via mpv sub-visibility
+    SetSubTrack(i64), // select subtitle track via mpv sid
+    SetQuality(u32, u32), // SW render target W/H (360p/540p/720p)
     Skip(i32),
     Stop,
 }
@@ -45,8 +49,62 @@ pub enum PlayerEvent {
     Error(String),
     Ready { duration: Duration, width: u32, height: u32 },
     PositionUpdate { position: Duration, duration: Duration },
+    Chapters(Vec<ChapterInfo>), // embedded chapter list (once per file, if any)
+    SubTracks(Vec<SubTrackInfo>), // embedded subtitle tracks (once per file, if any)
+    CacheUpdate { readahead_secs: f64 }, // demuxer cache ahead of playhead
     VolumeChanged(f32),
     StateChanged(bool),
+}
+
+/// One embedded chapter (mpv `chapter-list`), jumpable from the seek bar.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChapterInfo {
+    pub title: String,
+    pub time: Duration,
+}
+
+/// One embedded subtitle track (mpv `track-list` filtered to `type == sub`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubTrackInfo {
+    /// mpv `sid` used to select this track.
+    pub id: i64,
+    pub title: String,
+    pub lang: String,
+}
+
+/// Software-render target quality (the "Quality" settings option).
+/// Higher = sharper image, more CPU (no GPU in the SW fallback path).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenderQuality {
+    P360,
+    P540,
+    P720,
+}
+
+impl RenderQuality {
+    pub const ALL: [RenderQuality; 3] = [RenderQuality::P360, RenderQuality::P540, RenderQuality::P720];
+
+    pub fn dimensions(self) -> (u32, u32) {
+        match self {
+            RenderQuality::P360 => (640, 360),
+            RenderQuality::P540 => (960, 540),
+            RenderQuality::P720 => (1280, 720),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            RenderQuality::P360 => "360p",
+            RenderQuality::P540 => "540p",
+            RenderQuality::P720 => "720p",
+        }
+    }
+}
+
+impl std::fmt::Display for RenderQuality {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
 }
 
 /// Global handle for subscription polling - holds Frame + PositionUpdate events
@@ -137,6 +195,76 @@ fn send_frame(
     if let Ok(mut cached) = texture_cache.try_lock() {
         *cached = Some(handle);
     }
+}
+
+/// Best-effort read of mpv's embedded chapter list.
+///
+/// libmpv2's safe API only exposes primitive getters, so indexed property
+/// paths (`chapter-list/count`, `chapter-list/i/title`, `chapter-list/i/time`)
+/// are used instead of node access. Any failure yields an empty vec — the UI
+/// simply shows no chapter markers. Never panics.
+fn read_chapters(mpv: &libmpv2::Mpv) -> Vec<ChapterInfo> {
+    let mut out = Vec::new();
+    let count = mpv
+        .get_property::<i64>("chapter-list/count")
+        .unwrap_or(0)
+        .clamp(0, 256) as usize;
+    for i in 0..count {
+        let time = mpv
+            .get_property::<f64>(&format!("chapter-list/{i}/time"))
+            .unwrap_or(-1.0);
+        if !time.is_finite() || time < 0.0 {
+            continue;
+        }
+        let title = mpv
+            .get_property::<String>(&format!("chapter-list/{i}/title"))
+            .unwrap_or_else(|_| format!("Chapter {}", i + 1));
+        out.push(ChapterInfo {
+            title,
+            time: Duration::from_secs_f64(time),
+        });
+    }
+    out
+}
+
+/// Best-effort read of mpv's embedded subtitle tracks.
+///
+/// Same indexed-property technique as chapters (`track-list/count`,
+/// `track-list/i/type|title|lang|id`). Only `type == "sub"` entries are
+/// kept. Empty vec = no subtitles (UI shows "No subtitles"). Never panics.
+fn read_sub_tracks(mpv: &libmpv2::Mpv) -> Vec<SubTrackInfo> {
+    let mut out = Vec::new();
+    let count = mpv
+        .get_property::<i64>("track-list/count")
+        .unwrap_or(0)
+        .clamp(0, 64) as usize;
+    for i in 0..count {
+        let track_type = mpv
+            .get_property::<String>(&format!("track-list/{i}/type"))
+            .unwrap_or_default();
+        if track_type != "sub" {
+            continue;
+        }
+        let id = mpv
+            .get_property::<i64>(&format!("track-list/{i}/id"))
+            .unwrap_or(-1);
+        if id < 0 {
+            continue;
+        }
+        let title = mpv
+            .get_property::<String>(&format!("track-list/{i}/title"))
+            .unwrap_or_default();
+        let lang = mpv
+            .get_property::<String>(&format!("track-list/{i}/lang"))
+            .unwrap_or_default();
+        let title = if title.is_empty() {
+            format!("Track {}", id)
+        } else {
+            title
+        };
+        out.push(SubTrackInfo { id, title, lang });
+    }
+    out
 }
 
 /// Handle to background mpv task - cheap clone for UI.
@@ -264,14 +392,16 @@ impl VideoPlayerHandle {
                 height: 360,
             });
 
-            // Software rendering target size - fixed 640x360 for CPU efficiency (mpv will scale)
-            // Use 640x360 (16:9) as fallback, or 1280x720 if you want higher quality at cost of CPU
-            let target_w: u32 = 640;
-            let target_h: u32 = 360;
+            // Software rendering target size - default 640x360 for CPU efficiency.
+            // Adjustable at runtime via PlayerCmd::SetQuality (Quality menu).
+            let mut target_w: u32 = 640;
+            let mut target_h: u32 = 360;
 
             let mut paused = false;
             let mut volume: f32 = 0.7;
             let mut frame_counter: u64 = 0;
+            let mut chapters_sent = false;
+            let mut subs_sent = false;
 
             // Helper to generate dummy test pattern when SW not available
             let generate_dummy = |w: u32, h: u32, frame: u64| -> Handle {
@@ -353,6 +483,35 @@ impl VideoPlayerHandle {
                         PlayerCmd::SetRate(r) => {
                             if let Some(mpv) = &mpv_opt {
                                 let _ = mpv.set_property("speed", r as f64);
+                            }
+                        }
+                        PlayerCmd::SetLoop(looping) => {
+                            if let Some(mpv) = &mpv_opt {
+                                // Native mpv file loop: repeats the current file
+                                // without any UI-side EOF polling or re-spawn.
+                                let _ = mpv.command(
+                                    "set",
+                                    &["loop-file", if looping { "inf" } else { "no" }],
+                                );
+                            }
+                        }
+                        PlayerCmd::SetSubVisibility(visible) => {
+                            if let Some(mpv) = &mpv_opt {
+                                // CC toggle: libmpv bakes subs/OSD into the SW
+                                // frame, so this flips rendered captions.
+                                let _ = mpv.set_property("sub-visibility", visible);
+                            }
+                        }
+                        PlayerCmd::SetSubTrack(id) => {
+                            if let Some(mpv) = &mpv_opt {
+                                // Select subtitle track by mpv sid.
+                                let _ = mpv.set_property("sid", id);
+                            }
+                        }
+                        PlayerCmd::SetQuality(w, h) => {
+                            if (320..=1920).contains(&w) && (180..=1080).contains(&h) {
+                                target_w = w;
+                                target_h = h;
                             }
                         }
                         PlayerCmd::Skip(delta) => {
@@ -499,11 +658,42 @@ impl VideoPlayerHandle {
                             duration: Duration::from_secs_f64(dur),
                         });
                     }
+                    // Buffered indicator: demuxer cache ahead of the playhead.
+                    let readahead = mpv
+                        .get_property::<f64>("demuxer-cache-duration")
+                        .unwrap_or(0.0);
+                    if readahead.is_finite() && readahead > 0.0 {
+                        send_event(
+                            &evt_tx_for_thread,
+                            PlayerEvent::CacheUpdate { readahead_secs: readahead },
+                        );
+                    }
+                    // Chapters: poll until the (static) list appears, send once.
+                    if !chapters_sent {
+                        let chapters = read_chapters(mpv);
+                        if !chapters.is_empty() {
+                            send_event(&evt_tx_for_thread, PlayerEvent::Chapters(chapters));
+                            chapters_sent = true;
+                        }
+                    }
+                    // Subtitle tracks: same once-per-file pattern for the CC menu.
+                    if !subs_sent {
+                        let subs = read_sub_tracks(mpv);
+                        if !subs.is_empty() {
+                            send_event(&evt_tx_for_thread, PlayerEvent::SubTracks(subs));
+                            subs_sent = true;
+                        }
+                    }
                 } else {
                     // Dummy position simulation
                     let dur = Duration::from_secs(120);
                     let pos = Duration::from_secs_f64((frame_counter as f64 * 0.033) % 120.0);
                     send_event(&evt_tx_for_thread, PlayerEvent::PositionUpdate { position: pos, duration: dur });
+                    // Dummy source is fully "buffered" (test pattern, no I/O).
+                    send_event(
+                        &evt_tx_for_thread,
+                        PlayerEvent::CacheUpdate { readahead_secs: 120.0 },
+                    );
                 }
                 } // end ~10Hz PositionUpdate gate
 
@@ -571,6 +761,19 @@ impl VideoPlayerHandle {
     }
     pub fn set_rate(&self, r: f32) {
         let _ = self.cmd_tx.send(PlayerCmd::SetRate(r));
+    }
+    pub fn set_loop(&self, looping: bool) {
+        let _ = self.cmd_tx.send(PlayerCmd::SetLoop(looping));
+    }
+    pub fn set_sub_visibility(&self, visible: bool) {
+        let _ = self.cmd_tx.send(PlayerCmd::SetSubVisibility(visible));
+    }
+    pub fn set_sub_track(&self, id: i64) {
+        let _ = self.cmd_tx.send(PlayerCmd::SetSubTrack(id));
+    }
+    pub fn set_quality(&self, quality: RenderQuality) {
+        let (w, h) = quality.dimensions();
+        let _ = self.cmd_tx.send(PlayerCmd::SetQuality(w, h));
     }
     pub fn set_playback_speed(&self, s: f32) {
         self.set_rate(s);
