@@ -52,6 +52,7 @@ pub enum PlayerEvent {
     Chapters(Vec<ChapterInfo>), // embedded chapter list (once per file, if any)
     SubTracks(Vec<SubTrackInfo>), // embedded subtitle tracks (once per file, if any)
     CacheUpdate { readahead_secs: f64 }, // demuxer cache ahead of playhead
+    Buffering(bool), // mpv paused-for-cache (stream stall indicator)
     VolumeChanged(f32),
     StateChanged(bool),
 }
@@ -283,16 +284,35 @@ impl VideoPlayerHandle {
     /// Spawn background mpv thread with SW software rendering (Wayland stable fallback).
     /// Never blocks Iced async executor - CPU copy via Handle::from_pixels is stable.
     pub fn spawn(path: PathBuf) -> Self {
+        Self::spawn_inner(path.to_string_lossy().to_string())
+    }
+
+    /// Spawn for a network stream URL (HLS, DASH, direct http(s) media).
+    /// Same pipeline as files, but with the demuxer cache enabled so streams
+    /// actually buffer (local files keep `cache=no` for faster startup).
+    pub fn spawn_url(url: String) -> Self {
+        Self::spawn_inner(url)
+    }
+
+    fn spawn_inner(source: String) -> Self {
+        let path_for_global = source.clone();
+        // Network streams (HLS/DASH/direct media URLs) need the demuxer cache
+        // for smooth playback and real buffering stats; local files keep
+        // `cache=no` for faster startup.
+        let is_network =
+            source.starts_with("http://") || source.starts_with("https://");
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<PlayerCmd>();
         // Bounded frame-event channel (anti-flooding fix): the old unbounded
         // channel let 30fps ~1MB frames pile up without limit whenever the UI
         // stalled, spiralling into a freeze. `try_send` below drops instead of
         // queueing, so memory stays flat and the UI always gets fresh frames.
         let (evt_tx, evt_rx) = mpsc::channel::<PlayerEvent>(MAX_QUEUED_EVENTS);
-        let path_for_global = path.clone();
 
         let texture_handle: Arc<Mutex<Option<Handle>>> = Arc::new(Mutex::new(None));
-        info!("libmpv spawn with SW fallback (hwdec=no, vo=libmpv) for {:?}", path);
+        info!(
+            "libmpv spawn with SW fallback (hwdec=no, vo=libmpv) for {:?}",
+            source
+        );
 
         // For SW fallback we do NOT create mpv on UI thread (avoids GPU init on Wayland).
         // The mpv instance will be created inside the blocking thread with hwdec=no.
@@ -328,8 +348,13 @@ impl VideoPlayerHandle {
                 init.set_option("video-sync", "display-resample")?;
                 // Disable gpu hwdec interop for stability
                 let _ = init.set_option("gpu-hwdec-interop", "no");
-                // Reduce cache for faster startup
-                let _ = init.set_option("cache", "no");
+                if is_network {
+                    // Streams: demuxer cache on for smooth playback + stats.
+                    let _ = init.set_option("cache", "yes");
+                } else {
+                    // Local files: skip cache for faster startup.
+                    let _ = init.set_option("cache", "no");
+                }
                 Ok(())
             }) {
                 Ok(m) => {
@@ -362,15 +387,15 @@ impl VideoPlayerHandle {
                         render_ctx = ptr::null_mut();
                     }
 
-                    // Load file after render context is ready (mpv will queue frames)
-                    let path_str = path.to_string_lossy().to_string();
-                    match arc.command("loadfile", &[&path_str, "replace"]) {
+                    // Load file (or stream URL) after render context is ready
+                    // (mpv will queue frames)
+                    match arc.command("loadfile", &[&source, "replace"]) {
                         Ok(_) => {
                             let _ = arc.set_property("pause", false);
-                            info!("mpv loadfile success for {:?}", path);
+                            info!("mpv loadfile success for {:?}", source);
                         }
                         Err(e) => {
-                            warn!("mpv loadfile failed for {:?}: {:?}", path, e);
+                            warn!("mpv loadfile failed for {:?}: {:?}", source, e);
                             send_event(&evt_tx_for_thread, PlayerEvent::Error(format!("loadfile: {:?}", e)));
                         }
                     }
@@ -402,6 +427,7 @@ impl VideoPlayerHandle {
             let mut frame_counter: u64 = 0;
             let mut chapters_sent = false;
             let mut subs_sent = false;
+            let mut last_buffering = false;
 
             // Helper to generate dummy test pattern when SW not available
             let generate_dummy = |w: u32, h: u32, frame: u64| -> Handle {
@@ -667,6 +693,16 @@ impl VideoPlayerHandle {
                             &evt_tx_for_thread,
                             PlayerEvent::CacheUpdate { readahead_secs: readahead },
                         );
+                    }
+                    // Buffering indicator: only reported on change so the UI
+                    // isn't spammed (matters for streams; local files with
+                    // cache=no essentially never stall here).
+                    let buffering = mpv
+                        .get_property::<bool>("paused-for-cache")
+                        .unwrap_or(false);
+                    if buffering != last_buffering {
+                        last_buffering = buffering;
+                        send_event(&evt_tx_for_thread, PlayerEvent::Buffering(buffering));
                     }
                     // Chapters: poll until the (static) list appears, send once.
                     if !chapters_sent {

@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use iced::{
-    widget::{button, column, container, image, mouse_area, pick_list, row, scrollable, slider, text, Space, stack},
+    widget::{button, column, container, image, mouse_area, pick_list, row, scrollable, slider, text, text_input, Space, stack},
     Alignment, Background, Border, Color, Element, Length, Shadow, Task, Theme,
     keyboard::{self, key::Named},
     mouse,
@@ -74,6 +74,11 @@ pub enum Message {
     FolderSelected(Option<PathBuf>),
     LibraryScanned(Vec<PathBuf>),
     VideoSelected(PathBuf),
+    OpenUrlDialog, // show the network-stream URL input panel
+    UrlInputChanged(String), // URL text field edits
+    PlayUrl, // play the entered http(s) stream URL
+    CloseUrlDialog, // dismiss the URL panel
+    Buffering(bool), // mpv paused-for-cache stall indicator
     FileSelected(Option<PathBuf>),
     SetPlaybackMode(PlaybackMode),
     ToggleModeMenu, // three-dot popup with the playback-mode choices
@@ -126,6 +131,10 @@ pub struct OtipApp {
     library_videos: Vec<PathBuf>,
     thumbnails: HashMap<PathBuf, Handle>, // in-memory cache + temp file fallback
     selected_video_path: Option<PathBuf>,
+    stream_title: Option<String>, // playing URL when source is a network stream
+    url_dialog_open: bool, // network-stream URL input panel visible
+    url_input: String, // URL text field content
+    is_buffering: bool, // mpv stalled waiting for stream cache
     playback_mode: PlaybackMode,
     mode_menu_open: bool, // three-dot popup with Safe/Instant/Auto-Skip
     is_playing: bool,
@@ -167,6 +176,10 @@ impl OtipApp {
                 library_videos: Vec::new(),
                 thumbnails: HashMap::new(),
                 selected_video_path: None,
+                stream_title: None,
+                url_dialog_open: false,
+                url_input: String::new(),
+                is_buffering: false,
                 playback_mode: PlaybackMode::SafeMode,
                 mode_menu_open: false,
                 is_playing: false,
@@ -207,11 +220,48 @@ impl OtipApp {
                 .as_ref()
                 .and_then(|p| p.file_name())
                 .and_then(|n| n.to_str())
+                .map(|n| n.to_string())
+                .or_else(|| self.stream_title.clone())
                 .map(|n| format!("Otip — {} [{}]", n, self.playback_mode))
                 .unwrap_or_else(|| "Otip — Player".into()),
             AppScreen::Library => "Otip — Library".into(),
             AppScreen::Splash => "Otip — AI Content Moderator".into(),
         }
+    }
+
+    /// Push the current UI state (volume/loop/speed/subs/quality) into a
+    /// freshly spawned player so switching sources never silently resets it.
+    fn apply_state_to_player(&self, player: &VideoPlayerHandle) {
+        player.set_volume(self.volume);
+        player.set_loop(self.is_looping);
+        player.set_rate(self.playback_speed);
+        player.set_sub_visibility(self.show_subs);
+        player.set_quality(self.render_quality);
+    }
+
+    /// Reset per-source transient state (position, chapters, subs, cache).
+    fn reset_source_state(&mut self) {
+        self.position = Duration::ZERO;
+        self.duration = Duration::ZERO;
+        self.timeline_pos = 0.0;
+        self.video_handle = None;
+        self.chapters.clear();
+        self.buffered_ahead_secs = 0.0;
+        self.is_buffering = false;
+        self.sub_tracks.clear();
+        self.subtitle_options = vec![SubtitleOption::Off];
+        self.selected_subtitle = SubtitleOption::Off;
+    }
+
+    /// Stop the current player and drop its frame receiver (non-blocking).
+    /// Each spawn owns a dedicated render thread, so leaking the old one
+    /// would leave two producers flooding the channel (UI freeze). `stop()`
+    /// is a lock-free channel send — safe on the UI thread.
+    fn stop_current_player(&mut self) {
+        if let Some(old) = self.video_player.take() {
+            old.stop();
+        }
+        video_player::clear_frame_receiver();
     }
 
     /// Neighbor of the currently playing video inside `library_videos`.
@@ -329,42 +379,61 @@ impl OtipApp {
             // ── Engine Initialization (background, non-blocking) ───────
             Message::VideoSelected(path) => {
                 self.selected_video_path = Some(path.clone());
+                self.stream_title = None;
                 self.screen = AppScreen::Player;
                 self.is_playing = true;
-                self.position = Duration::ZERO;
-                self.duration = Duration::ZERO;
-                self.timeline_pos = 0.0;
-                self.video_handle = None;
                 self.controls_visible = true;
                 self.last_mouse_move = Instant::now();
-                // Stop any previous player first: each spawn owns a dedicated
-                // render thread, so leaking the old one would leave two 30fps
-                // producers flooding the channel (UI freeze). `stop()` is a
-                // lock-free channel send — safe on the UI thread.
-                if let Some(old) = self.video_player.take() {
-                    old.stop();
-                }
-                video_player::clear_frame_receiver();
+                self.stop_current_player();
                 // Spawn playbin with appsink in background thread; UI stays responsive
                 let player = VideoPlayerHandle::spawn(path.clone());
-                // Apply current UI state to the new player (volume/loop/speed
-                // otherwise reset to backend defaults on every video switch).
-                player.set_volume(self.volume);
-                player.set_loop(self.is_looping);
-                player.set_rate(self.playback_speed);
-                player.set_sub_visibility(self.show_subs);
-                player.set_quality(self.render_quality);
-                // Fresh file: drop stale chapters/buffered/subtitle state until
-                // the new render thread reports its own.
-                self.chapters.clear();
-                self.buffered_ahead_secs = 0.0;
-                self.sub_tracks.clear();
-                self.subtitle_options = vec![SubtitleOption::Off];
-                self.selected_subtitle = SubtitleOption::Off;
+                self.apply_state_to_player(&player);
+                self.reset_source_state();
                 self.video_player = Some(player);
                 self.status = format!("Loading: {}", path.display());
                 self.status_is_error = false;
                 tracing::info!("VideoSelected {:?} with mode {} → Player", path, self.playback_mode);
+                Task::none()
+            }
+            Message::OpenUrlDialog => {
+                self.url_dialog_open = true;
+                self.url_input.clear();
+                Task::none()
+            }
+            Message::UrlInputChanged(value) => {
+                self.url_input = value;
+                Task::none()
+            }
+            Message::CloseUrlDialog => {
+                self.url_dialog_open = false;
+                Task::none()
+            }
+            Message::PlayUrl => {
+                let url = self.url_input.trim().to_string();
+                if !is_playable_url(&url) {
+                    self.status = "Enter a direct http(s) media or HLS/DASH playlist URL".into();
+                    self.status_is_error = true;
+                    return Task::none();
+                }
+                self.url_dialog_open = false;
+                self.selected_video_path = None;
+                self.stream_title = Some(stream_display_name(&url));
+                self.screen = AppScreen::Player;
+                self.is_playing = true;
+                self.controls_visible = true;
+                self.last_mouse_move = Instant::now();
+                self.stop_current_player();
+                let player = VideoPlayerHandle::spawn_url(url.clone());
+                self.apply_state_to_player(&player);
+                self.reset_source_state();
+                self.video_player = Some(player);
+                self.status = format!("Loading stream: {}", url);
+                self.status_is_error = false;
+                tracing::info!("PlayUrl {:?} → Player", url);
+                Task::none()
+            }
+            Message::Buffering(buffering) => {
+                self.is_buffering = buffering;
                 Task::none()
             }
             Message::FileSelected(opt) => {
@@ -958,14 +1027,20 @@ impl OtipApp {
         };
         let top_bar = row![
             button(text("← Back").size(13)).on_press(Message::NavigateTo(AppScreen::Splash)).padding(8)
-                .style(|t: &Theme, _| button::Style {
+                .style(|_: &Theme, _| button::Style {
                     background: Some(Background::Color(palette::BG_HOVER)),
                     border: Border { color: palette::BG_HOVER, width: 1.0, radius: 6.0.into() },
-                    text_color: t.palette().text, shadow: Shadow::default(), snap: false
+                    text_color: palette::TEXT_MAIN, shadow: Shadow::default(), snap: false
                 }),
             Space::new().width(Length::Fill),
             text(folder_label).size(12).color(palette::TEXT_DIM),
             Space::new().width(Length::Fill),
+            button(text("🌐 Open URL").size(13).color(Color::WHITE)).on_press(Message::OpenUrlDialog).padding([8, 14])
+                .style(|_: &Theme, _| button::Style {
+                    background: Some(Background::Color(palette::BTN_BG)),
+                    border: Border { color: palette::DIVIDER, width: 1.0, radius: 6.0.into() },
+                    text_color: Color::WHITE, shadow: Shadow::default(), snap: false
+                }),
             button(text("📁 Select Folder").size(13).color(Color::WHITE)).on_press(Message::SelectFolder).padding([8, 14])
                 .style(|_: &Theme, _| button::Style {
                     background: Some(Background::Color(palette::ACCENT)),
@@ -975,6 +1050,54 @@ impl OtipApp {
         ].align_y(Alignment::Center).spacing(12).width(Length::Fill);
         let status_color = if self.status_is_error { palette::ALERT } else { palette::TEXT_DIM };
         let status = text(&self.status).size(11).color(status_color);
+
+        // Network stream URL panel (HLS/DASH/direct media). Shown below the
+        // top bar while open; Enter confirms, ✕ dismisses.
+        let url_panel: Element<Message> = if self.url_dialog_open {
+            container(
+                row![
+                    text_input("https://example.com/stream.m3u8", &self.url_input)
+                        .on_input(Message::UrlInputChanged)
+                        .on_submit(Message::PlayUrl)
+                        .padding(8)
+                        .width(Length::Fill),
+                    button(text("Open").size(13).color(Color::WHITE))
+                        .on_press(Message::PlayUrl)
+                        .padding([8, 14])
+                        .style(|_: &Theme, _| button::Style {
+                            background: Some(Background::Color(palette::ACCENT)),
+                            border: Border { radius: 6.0.into(), ..Default::default() },
+                            text_color: Color::WHITE, shadow: Shadow::default(), snap: false
+                        }),
+                    button(text("✕").size(13).color(Color::WHITE))
+                        .on_press(Message::CloseUrlDialog)
+                        .padding([8, 12])
+                        .style(|_: &Theme, _| button::Style {
+                            background: Some(Background::Color(palette::BTN_BG)),
+                            border: Border { radius: 6.0.into(), ..Default::default() },
+                            text_color: Color::WHITE, shadow: Shadow::default(), snap: false
+                        }),
+                ]
+                .align_y(Alignment::Center)
+                .spacing(8),
+            )
+            .width(Length::Fill)
+            .padding([10, 12])
+            .style(|_: &Theme| container::Style {
+                background: Some(Background::Color(palette::PANEL_BG)),
+                border: Border {
+                    color: palette::DIVIDER,
+                    width: 1.0,
+                    radius: 8.0.into(),
+                },
+                shadow: Shadow::default(),
+                text_color: Some(palette::TEXT_MAIN),
+                snap: false,
+            })
+            .into()
+        } else {
+            Space::new().height(Length::Fixed(0.0)).into()
+        };
 
         // Fix Issue 1: MUST render list/grid when videos is not empty, regardless of selected_folder
         // Only show "No folder selected" / "No videos" when videos is actually empty
@@ -1050,6 +1173,7 @@ impl OtipApp {
         container(
             column![
                 top_bar,
+                url_panel,
                 Space::new().height(Length::Fixed(12.0)),
                 status,
                 Space::new().height(Length::Fixed(8.0)),
@@ -1085,7 +1209,7 @@ impl OtipApp {
             container(column![
                 text("▶ No video - select from library").size(18).color(Color::WHITE).align_x(Alignment::Center),
                 Space::new().height(Length::Fixed(8.0)),
-                text(self.selected_video_path.as_ref().and_then(|p| p.file_name()).and_then(|n| n.to_str()).unwrap_or("no file")).size(12).color(palette::TEXT_MAIN),
+                text(self.selected_video_path.as_ref().and_then(|p| p.file_name()).and_then(|n| n.to_str()).map(|n| n.to_string()).or_else(|| self.stream_title.clone()).unwrap_or("no file".into())).size(12).color(palette::TEXT_MAIN),
                 Space::new().height(Length::Fixed(8.0)),
                 text(if self.video_player.is_some() { "Loading video (SW fallback)..." } else { "" }).size(11).color(palette::TEXT_DIM),
             ].align_x(Alignment::Center).spacing(4))
@@ -1195,6 +1319,23 @@ impl OtipApp {
         let time_label = match current_chapter_title(&self.chapters, self.position) {
             Some(title) => format!("{}  •  {}", time_text, title),
             None => time_text,
+        };
+
+        // Buffering badge: shown while mpv stalls waiting for stream cache
+        // (paused-for-cache). Hidden otherwise to keep the bar compact.
+        let buffering_badge: Element<Message> = if self.is_buffering {
+            container(text("⏳ Buffering…").size(11).color(palette::TEXT_MAIN))
+                .padding([4, 8])
+                .style(|_: &Theme| container::Style {
+                    background: Some(Background::Color(palette::BTN_BG)),
+                    border: Border { radius: 6.0.into(), ..Default::default() },
+                    shadow: Shadow::default(),
+                    text_color: None,
+                    snap: false,
+                })
+                .into()
+        } else {
+            Space::new().width(Length::Shrink).into()
         };
 
         // Buffered strip: thin bar above the seek slider showing how far the
@@ -1334,6 +1475,7 @@ impl OtipApp {
             button(text("Next ⏭").size(11)).on_press(Message::NextVideo).padding([6,10])
                 .style(|_: &Theme, _| button::Style{ background: Some(Background::Color(palette::BTN_BG)), border: Border{ radius:6.0.into(), ..Default::default()}, text_color: Color::WHITE, shadow: Shadow::default(), snap:false }),
             text(time_label).size(12).color(palette::TEXT_MAIN),
+            buffering_badge,
             volume_row,
             cc_btn,
             settings_btn,
@@ -1577,6 +1719,35 @@ fn build_subtitle_options(tracks: &[SubTrackInfo]) -> Vec<SubtitleOption> {
     options
 }
 
+/// Accepts direct http(s) media URLs and HLS/DASH playlists. Watch-page URLs
+/// (e.g. youtube.com/watch) need an external extractor and are rejected with
+/// a hint instead of failing silently inside mpv.
+fn is_playable_url(text: &str) -> bool {
+    let url = text.trim();
+    (url.starts_with("http://") || url.starts_with("https://")) && url.len() > 12
+}
+
+/// Short display name for a stream: host + truncated path, for the window
+/// title and the player placeholder.
+fn stream_display_name(url: &str) -> String {
+    let url = url.trim();
+    let without_scheme = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+    let host = without_scheme.split('/').next().unwrap_or(without_scheme);
+    if host.is_empty() {
+        return "Network stream".to_string();
+    }
+    const MAX: usize = 48;
+    if without_scheme.chars().count() > MAX {
+        let truncated: String = without_scheme.chars().take(MAX).collect();
+        format!("{}…", truncated)
+    } else {
+        without_scheme.to_string()
+    }
+}
+
 fn overlay_btn<'a>(label: &'a str, mode: PlaybackMode, active: bool) -> Element<'a, Message> {    button(text(label).size(11).align_x(Alignment::Center)).on_press(Message::SetPlaybackMode(mode)).padding([6,10])
         .style(move |_: &Theme, _| button::Style{
             background: Some(Background::Color(if active { palette::ACCENT } else { palette::BTN_BG })),
@@ -1614,7 +1785,7 @@ fn update(app: &mut OtipApp, msg: Message) -> Task<Message> { app.update(msg) }
 fn view(app: &OtipApp) -> Element<Message> { app.view() }
 fn theme(_: &OtipApp) -> Theme { Theme::Dark }
 fn title(app: &OtipApp) -> String { app.title() }
-fn subscription(_app: &OtipApp) -> iced::Subscription<Message> {
+fn subscription(app: &OtipApp) -> iced::Subscription<Message> {
     let window_opened = iced::window::open_events().map(Message::WindowOpened);
     // 4. Backend wiring helpers + 3. Keyboard shortcuts via events_with + 2. Auto-hide tick
     let frames = iced::Subscription::run(|| {
@@ -1638,6 +1809,7 @@ fn subscription(_app: &OtipApp) -> iced::Subscription<Message> {
                 let mut latest_chapters: Option<Vec<ChapterInfo>> = None;
                 let mut latest_subs: Option<Vec<SubTrackInfo>> = None;
                 let mut latest_cache: Option<f64> = None;
+                let mut latest_buffering: Option<bool> = None;
                 let (frame, pos_update) = if let Some(rx_arc) = rx_arc_opt {
                     match rx_arc.try_lock() {
                         Ok(mut guard) => {
@@ -1655,6 +1827,7 @@ fn subscription(_app: &OtipApp) -> iced::Subscription<Message> {
                                         PlayerEvent::Chapters(ch) => latest_chapters = Some(ch),
                                         PlayerEvent::SubTracks(subs) => latest_subs = Some(subs),
                                         PlayerEvent::CacheUpdate { readahead_secs } => latest_cache = Some(readahead_secs),
+                                        PlayerEvent::Buffering(buffering) => latest_buffering = Some(buffering),
                                         PlayerEvent::StateChanged(_playing) => {},
                                         PlayerEvent::VolumeChanged(_) => {},
                                         PlayerEvent::Ready { .. } => {},
@@ -1685,6 +1858,9 @@ fn subscription(_app: &OtipApp) -> iced::Subscription<Message> {
                 if let Some(readahead) = latest_cache.take() {
                     if out.send(Message::CacheUpdate(readahead)).await.is_err() { break; }
                 }
+                if let Some(buffering) = latest_buffering.take() {
+                    if out.send(Message::Buffering(buffering)).await.is_err() { break; }
+                }
                 if let Some((pos, dur)) = pos_update {
                     if out.send(Message::PositionUpdate(pos, dur)).await.is_err() { break; }
                 }
@@ -1695,38 +1871,46 @@ fn subscription(_app: &OtipApp) -> iced::Subscription<Message> {
     let close_requests = iced::window::close_requests().map(|_id| Message::CloseRequested);
     // 2. Auto-hide tick: check every 200ms if 3s elapsed since last mouse move
     let tick = iced::time::every(Duration::from_millis(200)).map(Message::Tick);
-    // 3. Accessibility & Keyboard Shortcuts via iced::subscription::events_with (Iced 0.14: event::listen_with)
-    // Spec: Space Play/Pause, Left/Right 5s seek, Up/Down volume 10%, F fullscreen
-    let events = iced::event::listen_with(|event, _status, _window| {
-        // subscription::events_with equivalent
-        match event {
-            Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) => {
-                if modifiers.command() || modifiers.control() {
-                    return None;
-                }
-                match key.as_ref() {
-                    keyboard::Key::Named(Named::Space) => Some(Message::PlayPause),
-                    keyboard::Key::Named(Named::ArrowLeft) => Some(Message::SeekRelative(-5.0)),
-                    keyboard::Key::Named(Named::ArrowRight) => Some(Message::SeekRelative(5.0)),
-                    keyboard::Key::Named(Named::ArrowUp) => Some(Message::VolumeUp),
-                    keyboard::Key::Named(Named::ArrowDown) => Some(Message::VolumeDown),
-                    keyboard::Key::Character("f") | keyboard::Key::Character("F") => Some(Message::ToggleFullscreen),
-                    keyboard::Key::Character("m") | keyboard::Key::Character("M") => Some(Message::ToggleMute),
-                    keyboard::Key::Character("c") | keyboard::Key::Character("C") => Some(Message::ToggleCaptions),
-                    keyboard::Key::Character("l") | keyboard::Key::Character("L") => Some(Message::ToggleLoop),
-                    _ => None,
-                }
-            }
-            Event::Mouse(mouse::Event::CursorMoved { .. }) => Some(Message::MouseMoved),
-            _ => None,
-        }
+    // 3. Mouse movement (always on): drives control auto-hide reveal.
+    let mouse_events = iced::event::listen_with(|event, _status, _window| match event {
+        Event::Mouse(mouse::Event::CursorMoved { .. }) => Some(Message::MouseMoved),
+        _ => None,
     });
+    // 4. Keyboard shortcuts (Space/arrows/F/M/C/L). Suspended while the URL
+    // dialog is open so typing a stream address never toggles playback.
+    // Spec: Space Play/Pause, Left/Right 5s seek, Up/Down volume 10%, F fullscreen
+    let key_events = if app.url_dialog_open {
+        iced::Subscription::none()
+    } else {
+        iced::event::listen_with(|event, _status, _window| {
+            match event {
+                Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) => {
+                    if modifiers.command() || modifiers.control() {
+                        return None;
+                    }
+                    match key.as_ref() {
+                        keyboard::Key::Named(Named::Space) => Some(Message::PlayPause),
+                        keyboard::Key::Named(Named::ArrowLeft) => Some(Message::SeekRelative(-5.0)),
+                        keyboard::Key::Named(Named::ArrowRight) => Some(Message::SeekRelative(5.0)),
+                        keyboard::Key::Named(Named::ArrowUp) => Some(Message::VolumeUp),
+                        keyboard::Key::Named(Named::ArrowDown) => Some(Message::VolumeDown),
+                        keyboard::Key::Character("f") | keyboard::Key::Character("F") => Some(Message::ToggleFullscreen),
+                        keyboard::Key::Character("m") | keyboard::Key::Character("M") => Some(Message::ToggleMute),
+                        keyboard::Key::Character("c") | keyboard::Key::Character("C") => Some(Message::ToggleCaptions),
+                        keyboard::Key::Character("l") | keyboard::Key::Character("L") => Some(Message::ToggleLoop),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+        })
+    };
     // NOTE: no 60fps Noop redraw pump. FrameReady/PositionUpdate messages
     // already drive re-renders when a new frame actually arrives; a blind
     // 60Hz Noop forced a full re-render (and 1MB texture upload) every 16ms
     // even with no new content, saturating the UI thread so buttons and newly
     // added elements stopped responding — the reported freeze.
-    iced::Subscription::batch(vec![frames, close_requests, window_opened, tick, events])
+    iced::Subscription::batch(vec![frames, close_requests, window_opened, tick, mouse_events, key_events])
 }
 
 fn main() -> iced::Result {
@@ -1906,12 +2090,84 @@ mod player_controls_tests {
     }
 
     #[test]
-    fn mode_menu_opens_and_closes_on_select() {        let (mut app, _) = OtipApp::new();
+    fn mode_menu_opens_and_closes_on_select() {
+        let (mut app, _) = OtipApp::new();
         assert!(!app.mode_menu_open);
         let _ = app.update(Message::ToggleModeMenu);
         assert!(app.mode_menu_open);
         let _ = app.update(Message::SetPlaybackMode(PlaybackMode::AutoSkip));
         assert_eq!(app.playback_mode, PlaybackMode::AutoSkip);
         assert!(!app.mode_menu_open);
+    }
+
+    #[test]
+    fn stream_url_validation() {
+        assert!(is_playable_url("https://example.com/video.mp4"));
+        assert!(is_playable_url("http://example.com/live.m3u8"));
+        assert!(is_playable_url("  https://example.com/v.mpd  "));
+        assert!(!is_playable_url(""));
+        assert!(!is_playable_url("ftp://example.com/video.mp4"));
+        assert!(!is_playable_url("/home/user/video.mp4"));
+        assert!(!is_playable_url("https://x"));
+    }
+
+    #[test]
+    fn stream_display_name_uses_host() {
+        assert_eq!(
+            stream_display_name("https://cdn.example.com/live/playlist.m3u8"),
+            "cdn.example.com/live/playlist.m3u8"
+        );
+        assert_eq!(stream_display_name("http://example.com"), "example.com");
+        let long = format!("https://example.com/{}", "a".repeat(100));
+        let shown = stream_display_name(&long);
+        assert!(shown.ends_with('…'));
+        assert_eq!(shown.chars().count(), 49);
+    }
+
+    #[test]
+    fn url_dialog_flow_rejects_bad_input() {
+        let (mut app, _) = OtipApp::new();
+        let _ = app.update(Message::OpenUrlDialog);
+        assert!(app.url_dialog_open);
+        let _ = app.update(Message::UrlInputChanged("not a url".into()));
+        let _ = app.update(Message::PlayUrl);
+        // Rejected: stays in Library with an error status, no player spawned.
+        assert_eq!(app.screen, AppScreen::Splash);
+        assert!(app.video_player.is_none());
+        assert!(app.status_is_error);
+        let _ = app.update(Message::CloseUrlDialog);
+        assert!(!app.url_dialog_open);
+    }
+
+    #[test]
+    fn play_url_starts_stream_player() {
+        let (mut app, _) = OtipApp::new();
+        let _ = app.update(Message::OpenUrlDialog);
+        let _ = app.update(Message::UrlInputChanged(
+            "https://example.com/stream.m3u8".into(),
+        ));
+        let _ = app.update(Message::PlayUrl);
+        assert_eq!(app.screen, AppScreen::Player);
+        assert!(app.video_player.is_some());
+        assert!(app.selected_video_path.is_none());
+        assert_eq!(
+            app.stream_title,
+            Some("example.com/stream.m3u8".to_string())
+        );
+        assert!(!app.url_dialog_open);
+        assert!(app.title().contains("example.com"));
+        // No explicit stop: dropping `app` disconnects the command channel
+        // and the render thread exits on its own. (CloseWindow needs a tokio
+        // runtime for its detached stop task, so it can't run in unit tests.)
+    }
+
+    #[test]
+    fn buffering_state_flips() {
+        let (mut app, _) = OtipApp::new();
+        assert!(!app.is_buffering);
+        let _ = app.update(Message::Buffering(true));
+        assert!(app.is_buffering);
+        let _ = app.update(Message::Buffering(false));
+        assert!(!app.is_buffering);
     }
 }
