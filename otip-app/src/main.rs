@@ -76,6 +76,7 @@ pub enum Message {
     VideoSelected(PathBuf),
     OpenUrlDialog, // show the network-stream URL input panel
     UrlInputChanged(String), // URL text field edits
+    AiPromptChanged(String), // AI skip prompt text field edits
     PlayUrl, // play the entered http(s) stream URL
     CloseUrlDialog, // dismiss the URL panel
     Buffering(bool), // mpv paused-for-cache stall indicator
@@ -148,6 +149,7 @@ pub struct OtipApp {
     video_handle: Option<Handle>, // last frame for iced::widget::Image
     // ── Professional controls state ──
     last_mouse_move: Instant, // auto-hide: track last mouse movement
+    last_skip: Duration, // last auto-skip timestamp for debounce
     controls_visible: bool,   // progressive disclosure: visible after move, hidden after 3s
     is_muted: bool,
     prev_volume: f32,
@@ -158,6 +160,8 @@ pub struct OtipApp {
     subtitle_options: Vec<SubtitleOption>, // Off + one entry per track
     selected_subtitle: SubtitleOption, // current picker selection
     settings_open: bool, // gear menu popup visible
+    unsafe_segments: Vec<(Duration, Duration)>, // auto-skip regions
+    ai_skip_prompt: String, // custom AI skip prompt from user
     render_quality: RenderQuality, // SW render target (Quality menu)
     chapters: Vec<ChapterInfo>, // embedded chapters, jumpable from seek bar
     buffered_ahead_secs: f64, // demuxer cache ahead of playhead (buffered strip)
@@ -190,6 +194,7 @@ impl OtipApp {
                 status: "Welcome to Otip".into(),
                 video_player: None,
                 last_mouse_move: Instant::now(),
+                last_skip: Duration::ZERO, // last auto-skip timestamp for debounce
                 controls_visible: true,
                 is_muted: false,
                 prev_volume: 0.7,
@@ -208,6 +213,8 @@ impl OtipApp {
                 status_is_error: false,
                 video_handle: None,
                 window_id: None,
+                unsafe_segments: vec![(Duration::from_secs(15), Duration::from_secs(25))], // dummy: skip 15s-25s for testing
+                ai_skip_prompt: String::new(), // custom AI skip prompt from user
             },
             Task::none(),
         )
@@ -380,6 +387,7 @@ impl OtipApp {
             Message::VideoSelected(path) => {
                 self.selected_video_path = Some(path.clone());
                 self.stream_title = None;
+                self.url_dialog_open = false;  // Close URL dialog when loading local video
                 self.screen = AppScreen::Player;
                 self.is_playing = true;
                 self.controls_visible = true;
@@ -402,6 +410,10 @@ impl OtipApp {
             }
             Message::UrlInputChanged(value) => {
                 self.url_input = value;
+                Task::none()
+            }
+            Message::AiPromptChanged(value) => {
+                self.ai_skip_prompt = value;
                 Task::none()
             }
             Message::CloseUrlDialog => {
@@ -807,6 +819,35 @@ impl OtipApp {
                 self.duration = dur;
                 if dur.as_secs_f32() > 0.0 {
                     self.timeline_pos = (pos.as_secs_f32() / dur.as_secs_f32()).clamp(0.0, 1.0);
+                }
+                // Auto-Skip: if Auto-Skip mode is enabled, jump over unsafe segments
+                if self.playback_mode == PlaybackMode::AutoSkip {
+                    let mut skipped = false;
+                    for (seg_start, seg_end) in &self.unsafe_segments {
+                        // Only skip if currently inside the segment and not already past it
+                        if self.position >= *seg_start && self.position < *seg_end {
+                            // Debounce: only seek if enough time has passed since last seek
+                            // (prevents 60 seeks per second while waiting for MPV)
+                            let last_skip = self.last_skip;
+                            if self.position > last_skip && self.position - last_skip > Duration::from_millis(200) {
+                                // Seek to end of segment
+                                let _ = self.video_player.as_ref().map(|p| p.seek_to(*seg_end));
+                                self.last_skip = self.position;
+                                skipped = true;
+                                tracing::info!("Auto-Skipping sensitive scene from {:?} to {:?}", seg_start, seg_end);
+                                break; // Only skip one segment per position update
+                            }
+                        }
+                    }
+                    // If we didn't skip but were inside a segment, reset last_skip when leaving
+                    if !skipped {
+                        // Check if we just left a segment
+                        for (seg_start, seg_end) in &self.unsafe_segments {
+                            if self.position < *seg_start && self.last_skip >= *seg_start {
+                                self.last_skip = Duration::ZERO;
+                            }
+                        }
+                    }
                 }
                 Task::none()
             }
@@ -1269,6 +1310,32 @@ impl OtipApp {
                     PlaybackMode::AutoSkip,
                     current_mode
                 ),
+                // AI Skip Prompt Input
+                container(
+                    column![
+                        text("AI Skip Prompt").size(11).color(palette::TEXT_DIM),
+                        text_input(
+                            "What should the AI skip? e.g. sponsorships, violence...",
+                            &self.ai_skip_prompt
+                        )
+                        .on_input(Message::AiPromptChanged)
+                        .padding(8)
+                        .style(|_: &Theme, _| iced::widget::text_input::Style {
+                            background: Background::Color(palette::BG_ELEVATED),
+                            border: Border {
+                                color: palette::DIVIDER,
+                                width: 1.0,
+                                radius: 6.0.into(),
+                            },
+                            placeholder: palette::TEXT_DIM,
+                            value: palette::TEXT_MAIN,
+                            selection: palette::ACCENT_SOFT,
+                            icon: palette::TEXT_DIM,
+                        })
+                    ]
+                    .spacing(4)
+                )
+                .padding([8, 0])
             ]
             .spacing(4))
             .padding(10)
