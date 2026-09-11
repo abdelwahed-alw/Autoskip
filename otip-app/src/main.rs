@@ -98,6 +98,8 @@ pub enum Message {
     SubTracksLoaded(Vec<SubTrackInfo>), // embedded subtitle tracks from mpv
     ToggleSettings, // gear menu popup (quality options)
     QualitySelected(RenderQuality), // SW render target -> VideoPlayerHandle::set_quality
+    GeminiApiKeyChanged(String), // Gemini API key text field edits
+    GeminiModelSelected(String), // Gemini model selection
     ChaptersLoaded(Vec<ChapterInfo>), // embedded chapters from mpv chapter-list
     CacheUpdate(f64), // demuxer readahead secs -> buffered strip
     ToggleMini, // mini/PiP mode: small always-on-top window
@@ -162,6 +164,8 @@ pub struct OtipApp {
     settings_open: bool, // gear menu popup visible
     unsafe_segments: Vec<(Duration, Duration)>, // auto-skip regions
     ai_skip_prompt: String, // custom AI skip prompt from user
+    gemini_api_key: String, // user's Gemini API key
+    gemini_model: String, // selected Gemini model
     render_quality: RenderQuality, // SW render target (Quality menu)
     chapters: Vec<ChapterInfo>, // embedded chapters, jumpable from seek bar
     buffered_ahead_secs: f64, // demuxer cache ahead of playhead (buffered strip)
@@ -215,6 +219,8 @@ impl OtipApp {
                 window_id: None,
                 unsafe_segments: vec![(Duration::from_secs(15), Duration::from_secs(25))], // dummy: skip 15s-25s for testing
                 ai_skip_prompt: String::new(), // custom AI skip prompt from user
+                gemini_api_key: String::new(), // user's Gemini API key
+                gemini_model: "gemini-3.7-flash".to_string(), // selected Gemini model
             },
             Task::none(),
         )
@@ -578,6 +584,19 @@ impl OtipApp {
                 if let Some(p) = &self.video_player {
                     p.set_quality(q);
                 }
+                Task::none()
+            }
+            Message::GeminiApiKeyChanged(key) => {
+                self.gemini_api_key = key;
+                self.last_mouse_move = Instant::now();
+                self.controls_visible = true;
+                // Optionally save to config file here
+                Task::none()
+            }
+            Message::GeminiModelSelected(model) => {
+                self.gemini_model = model.to_string();
+                self.last_mouse_move = Instant::now();
+                self.controls_visible = true;
                 Task::none()
             }
             Message::ChaptersLoaded(chapters) => {
@@ -1631,6 +1650,48 @@ impl OtipApp {
                     ]
                     .align_y(Alignment::Center)
                     .spacing(10),
+                    // Gemini API Key Input
+                    row![
+                        text("Gemini API Key").size(12).color(palette::TEXT_MAIN),
+                        text_input(
+                            "Enter your Gemini API key...",
+                            &self.gemini_api_key
+                        )
+                        .on_input(Message::GeminiApiKeyChanged)
+                        .padding(8)
+                        .width(Length::FillPortion(2))
+                        .style(|_: &Theme, _| iced::widget::text_input::Style {
+                            background: Background::Color(palette::BG_ELEVATED),
+                            border: Border {
+                                color: palette::DIVIDER,
+                                width: 1.0,
+                                radius: 6.0.into(),
+                            },
+                            placeholder: palette::TEXT_DIM,
+                            value: palette::TEXT_MAIN,
+                            selection: palette::ACCENT_SOFT,
+                            icon: palette::TEXT_DIM,
+                        }),
+                        Space::new().width(Length::Fixed(8.0)),
+                        text("Get key at aistudio.google.com").size(11).color(palette::TEXT_DIM),
+                    ]
+                    .align_y(Alignment::Center)
+                    .spacing(8),
+                    // Gemini Model Selector
+                    row![
+                        text("Gemini Model").size(12).color(palette::TEXT_MAIN),
+                        pick_list(
+                            &GEMINI_MODELS[..],
+                            Some(self.gemini_model.as_str()),
+                            |s: &str| Message::GeminiModelSelected(s.to_string()),
+                        )
+                        .placeholder("gemini-3.7-flash")
+                        .width(Length::Fixed(200.0))
+                        .style(dark_pick_list_style()),
+                        text("Model used for AI skip analysis").size(11).color(palette::TEXT_DIM),
+                    ]
+                    .align_y(Alignment::Center)
+                    .spacing(10),
                 ]
                 .spacing(8),
             )
@@ -1661,6 +1722,14 @@ impl OtipApp {
 
 /// Playback-speed options shown in the speed `pick_list` dropdown.
 const SPEED_OPTIONS: [&str; 4] = ["0.5x", "1.0x", "1.5x", "2.0x"];
+
+/// Gemini models available for selection.
+const GEMINI_MODELS: [&str; 4] = [
+    "gemini-3.7-flash",
+    "gemini-2.0-flash",
+    "gemini-1.5-flash-latest",
+    "gemini-3.5-flash-lite",
+];
 
 /// Current speed → dropdown label (nearest option shown as selected).
 fn speed_label(speed: f32) -> &'static str {
