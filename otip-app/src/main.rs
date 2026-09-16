@@ -100,6 +100,8 @@ pub enum Message {
     QualitySelected(RenderQuality), // SW render target -> VideoPlayerHandle::set_quality
     GeminiApiKeyChanged(String), // Gemini API key text field edits
     GeminiModelSelected(String), // Gemini model selection
+    StartAiScan, // "Start AI Scan" button -> Gemini frame analysis -> auto-skip regions
+    AiScanComplete(Vec<(Duration, Duration)>), // parsed skip timestamps from run_ai_scan
     ChaptersLoaded(Vec<ChapterInfo>), // embedded chapters from mpv chapter-list
     CacheUpdate(f64), // demuxer readahead secs -> buffered strip
     ToggleMini, // mini/PiP mode: small always-on-top window
@@ -597,6 +599,64 @@ impl OtipApp {
                 self.gemini_model = model.to_string();
                 self.last_mouse_move = Instant::now();
                 self.controls_visible = true;
+                Task::none()
+            }
+            Message::StartAiScan => {
+                // Validate inputs before spawning the async Gemini pipeline.
+                if self.gemini_api_key.trim().is_empty() {
+                    self.status = "Enter your Gemini API key to run AI scan".into();
+                    self.status_is_error = true;
+                    return Task::none();
+                }
+                // self.video_player holds the live backend; selected_video_path
+                // holds the file to analyse. Both must be present — a network
+                // stream (no local path) cannot be frame-scanned.
+                if self.video_player.is_none() || self.selected_video_path.is_none() {
+                    self.status = "Load a local video before starting AI scan".into();
+                    self.status_is_error = true;
+                    return Task::none();
+                }
+                let video_path = match self.selected_video_path.clone() {
+                    Some(p) => p,
+                    None => {
+                        self.status = "Load a local video before starting AI scan".into();
+                        self.status_is_error = true;
+                        return Task::none();
+                    }
+                };
+                self.status = "Scanning video with AI...".into();
+                self.status_is_error = false;
+                self.last_mouse_move = Instant::now();
+                self.controls_visible = true;
+                // Bridge into the existing GridScanner / AI logic in
+                // otip-core/src/scan.rs, passing all four UI inputs.
+                let gemini_api_key = self.gemini_api_key.clone();
+                let gemini_model = self.gemini_model.clone();
+                let ai_skip_prompt = self.ai_skip_prompt.clone();
+                tracing::info!(
+                    "StartAiScan: {} with model {} (prompt {} chars)",
+                    video_path.display(),
+                    gemini_model,
+                    ai_skip_prompt.len()
+                );
+                Task::perform(
+                    otip_core::scan::run_ai_scan(
+                        video_path,
+                        gemini_api_key,
+                        gemini_model,
+                        ai_skip_prompt,
+                    ),
+                    Message::AiScanComplete,
+                )
+            }
+            Message::AiScanComplete(segments) => {
+                let count = segments.len();
+                self.unsafe_segments = segments;
+                self.status = format!("AI Scan Complete: Found {} skip segments!", count);
+                self.status_is_error = false;
+                self.last_mouse_move = Instant::now();
+                self.controls_visible = true;
+                tracing::info!("AiScanComplete: {} skip segments -> auto-skip regions", count);
                 Task::none()
             }
             Message::ChaptersLoaded(chapters) => {
@@ -1329,7 +1389,7 @@ impl OtipApp {
                     PlaybackMode::AutoSkip,
                     current_mode
                 ),
-                // AI Skip Prompt Input
+                // AI Skip Prompt Input + Start AI Scan trigger
                 container(
                     column![
                         text("AI Skip Prompt").size(11).color(palette::TEXT_DIM),
@@ -1350,7 +1410,17 @@ impl OtipApp {
                             value: palette::TEXT_MAIN,
                             selection: palette::ACCENT_SOFT,
                             icon: palette::TEXT_DIM,
-                        })
+                        }),
+                        button(text("Start AI Scan").size(12).color(Color::WHITE))
+                            .on_press(Message::StartAiScan)
+                            .padding([8, 14])
+                            .style(|_: &Theme, _| button::Style {
+                                background: Some(Background::Color(palette::ACCENT)),
+                                border: Border { radius: 6.0.into(), ..Default::default() },
+                                text_color: Color::WHITE,
+                                shadow: Shadow::default(),
+                                snap: false,
+                            }),
                     ]
                     .spacing(4)
                 )
@@ -1689,6 +1759,33 @@ impl OtipApp {
                         .width(Length::Fixed(200.0))
                         .style(dark_pick_list_style()),
                         text("Model used for AI skip analysis").size(11).color(palette::TEXT_DIM),
+                    ]
+                    .align_y(Alignment::Center)
+                    .spacing(10),
+                    // AI Scan execution bridge: runs Gemini analysis with the
+                    // custom prompt and populates auto-skip regions.
+                    row![
+                        button(text("Start AI Scan").size(12).color(Color::WHITE))
+                            .on_press(Message::StartAiScan)
+                            .padding([8, 14])
+                            .style(|_: &Theme, _| button::Style {
+                                background: Some(Background::Color(palette::ACCENT)),
+                                border: Border { radius: 6.0.into(), ..Default::default() },
+                                text_color: Color::WHITE,
+                                shadow: Shadow::default(),
+                                snap: false,
+                            }),
+                        text(self.status.clone())
+                            .size(11)
+                            .color(if self.status_is_error { palette::ALERT } else { palette::TEXT_DIM }),
+                        Space::new().width(Length::Fill),
+                        text(if self.unsafe_segments.is_empty() {
+                            "No skip segments yet".to_string()
+                        } else {
+                            format!("{} skip segment(s)", self.unsafe_segments.len())
+                        })
+                        .size(11)
+                        .color(palette::TEXT_DIM),
                     ]
                     .align_y(Alignment::Center)
                     .spacing(10),
