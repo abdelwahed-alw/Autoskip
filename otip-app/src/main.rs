@@ -97,6 +97,7 @@ pub enum Message {
     SubtitleSelected(SubtitleOption), // subtitle track choice -> sid + visibility
     SubTracksLoaded(Vec<SubTrackInfo>), // embedded subtitle tracks from mpv
     ToggleSettings, // gear menu popup (quality options)
+    ToggleAiPanel, // dedicated AI panel popup (Gemini key/model/prompt/scan)
     QualitySelected(RenderQuality), // SW render target -> VideoPlayerHandle::set_quality
     GeminiApiKeyChanged(String), // Gemini API key text field edits
     GeminiModelSelected(String), // Gemini model selection
@@ -164,6 +165,7 @@ pub struct OtipApp {
     subtitle_options: Vec<SubtitleOption>, // Off + one entry per track
     selected_subtitle: SubtitleOption, // current picker selection
     settings_open: bool, // gear menu popup visible
+    ai_panel_open: bool, // dedicated AI panel popup visible
     unsafe_segments: Vec<(Duration, Duration)>, // auto-skip regions
     ai_skip_prompt: String, // custom AI skip prompt from user
     gemini_api_key: String, // user's Gemini API key
@@ -211,6 +213,7 @@ impl OtipApp {
                 subtitle_options: vec![SubtitleOption::Off],
                 selected_subtitle: SubtitleOption::Off,
                 settings_open: false,
+                ai_panel_open: false,
                 render_quality: RenderQuality::P360, // SW default: cheap on CPU
                 chapters: Vec::new(),
                 buffered_ahead_secs: 0.0,
@@ -222,7 +225,7 @@ impl OtipApp {
                 unsafe_segments: vec![(Duration::from_secs(15), Duration::from_secs(25))], // dummy: skip 15s-25s for testing
                 ai_skip_prompt: String::new(), // custom AI skip prompt from user
                 gemini_api_key: String::new(), // user's Gemini API key
-                gemini_model: "gemini-3.7-flash".to_string(), // selected Gemini model
+                gemini_model: "gemini-3.8-flash".to_string(), // selected Gemini model
             },
             Task::none(),
         )
@@ -471,6 +474,10 @@ impl OtipApp {
             }
             Message::ToggleModeMenu => {
                 self.mode_menu_open = !self.mode_menu_open;
+                if self.mode_menu_open {
+                    self.settings_open = false;
+                    self.ai_panel_open = false;
+                }
                 self.last_mouse_move = Instant::now();
                 self.controls_visible = true;
                 Task::none()
@@ -575,6 +582,20 @@ impl OtipApp {
             }
             Message::ToggleSettings => {
                 self.settings_open = !self.settings_open;
+                if self.settings_open {
+                    self.mode_menu_open = false;
+                    self.ai_panel_open = false;
+                }
+                self.last_mouse_move = Instant::now();
+                self.controls_visible = true;
+                Task::none()
+            }
+            Message::ToggleAiPanel => {
+                self.ai_panel_open = !self.ai_panel_open;
+                if self.ai_panel_open {
+                    self.settings_open = false;
+                    self.mode_menu_open = false;
+                }
                 self.last_mouse_move = Instant::now();
                 self.controls_visible = true;
                 Task::none()
@@ -1314,6 +1335,122 @@ impl OtipApp {
         .into()
     }
 
+    fn view_ai_panel(&self) -> Element<Message> {
+        if !self.ai_panel_open {
+            return Space::new().height(Length::Fixed(0.0)).into();
+        }
+        container(
+            column![
+                text("✨ AI Content Scan").size(13).color(palette::TEXT_MAIN),
+                // Gemini API Key input
+                row![
+                    text("Gemini API Key").size(12).color(palette::TEXT_MAIN),
+                    text_input(
+                        "Enter your Gemini API key...",
+                        &self.gemini_api_key
+                    )
+                    .on_input(Message::GeminiApiKeyChanged)
+                    .padding(8)
+                    .width(Length::FillPortion(2))
+                    .style(|_: &Theme, _| iced::widget::text_input::Style {
+                        background: Background::Color(palette::BG_ELEVATED),
+                        border: Border {
+                            color: palette::DIVIDER,
+                            width: 1.0,
+                            radius: 6.0.into(),
+                        },
+                        placeholder: palette::TEXT_DIM,
+                        value: palette::TEXT_MAIN,
+                        selection: palette::ACCENT_SOFT,
+                        icon: palette::TEXT_DIM,
+                    }),
+                    text("Get key at aistudio.google.com").size(11).color(palette::TEXT_DIM),
+                ]
+                .align_y(Alignment::Center)
+                .spacing(8),
+                // Gemini Model selector
+                row![
+                    text("Gemini Model").size(12).color(palette::TEXT_MAIN),
+                    pick_list(
+                        &GEMINI_MODELS[..],
+                        Some(self.gemini_model.as_str()),
+                        |s: &str| Message::GeminiModelSelected(s.to_string()),
+                    )
+                    .placeholder("gemini-3.8-flash")
+                    .width(Length::Fixed(200.0))
+                    .style(dark_pick_list_style()),
+                    text("Model used for AI skip analysis").size(11).color(palette::TEXT_DIM),
+                ]
+                .align_y(Alignment::Center)
+                .spacing(10),
+                // AI Skip Prompt input
+                column![
+                    text("AI Skip Prompt").size(12).color(palette::TEXT_MAIN),
+                    text_input(
+                        "What should the AI skip? e.g. sponsorships, violence...",
+                        &self.ai_skip_prompt
+                    )
+                    .on_input(Message::AiPromptChanged)
+                    .padding(8)
+                    .style(|_: &Theme, _| iced::widget::text_input::Style {
+                        background: Background::Color(palette::BG_ELEVATED),
+                        border: Border {
+                            color: palette::DIVIDER,
+                            width: 1.0,
+                            radius: 6.0.into(),
+                        },
+                        placeholder: palette::TEXT_DIM,
+                        value: palette::TEXT_MAIN,
+                        selection: palette::ACCENT_SOFT,
+                        icon: palette::TEXT_DIM,
+                    }),
+                ]
+                .spacing(4),
+                // Start AI Scan + status
+                row![
+                    button(text("Start AI Scan").size(12).color(Color::WHITE))
+                        .on_press(Message::StartAiScan)
+                        .padding([8, 14])
+                        .style(|_: &Theme, _| button::Style {
+                            background: Some(Background::Color(palette::ACCENT)),
+                            border: Border { radius: 6.0.into(), ..Default::default() },
+                            text_color: Color::WHITE,
+                            shadow: Shadow::default(),
+                            snap: false,
+                        }),
+                    text(self.status.clone())
+                        .size(11)
+                        .color(if self.status_is_error { palette::ALERT } else { palette::TEXT_DIM }),
+                    Space::new().width(Length::Fill),
+                    text(if self.unsafe_segments.is_empty() {
+                        "No skip segments yet".to_string()
+                    } else {
+                        format!("{} skip segment(s)", self.unsafe_segments.len())
+                    })
+                    .size(11)
+                    .color(palette::TEXT_DIM),
+                ]
+                .align_y(Alignment::Center)
+                .spacing(10),
+            ]
+            .spacing(8),
+        )
+        .width(Length::Fill)
+        .padding([10, 14])
+        .style(|_: &Theme| container::Style {
+            background: Some(Background::Color(palette::PANEL_BG)),
+            border: Border {
+                color: palette::DIVIDER,
+                width: 1.0,
+                radius: 8.0.into(),
+            },
+            shadow: Shadow::default(),
+            text_color: Some(palette::TEXT_MAIN),
+            snap: false,
+        })
+        .into()
+    }
+
     fn view_player(&self) -> Element<Message> {
         // ── Video Rendering: Software fallback (Wayland stable) ──────
         // Previously: mpv hwdec=auto + wgpu zero-copy shared texture (empty stub on Wayland/Vulkan).
@@ -1389,42 +1526,6 @@ impl OtipApp {
                     PlaybackMode::AutoSkip,
                     current_mode
                 ),
-                // AI Skip Prompt Input + Start AI Scan trigger
-                container(
-                    column![
-                        text("AI Skip Prompt").size(11).color(palette::TEXT_DIM),
-                        text_input(
-                            "What should the AI skip? e.g. sponsorships, violence...",
-                            &self.ai_skip_prompt
-                        )
-                        .on_input(Message::AiPromptChanged)
-                        .padding(8)
-                        .style(|_: &Theme, _| iced::widget::text_input::Style {
-                            background: Background::Color(palette::BG_ELEVATED),
-                            border: Border {
-                                color: palette::DIVIDER,
-                                width: 1.0,
-                                radius: 6.0.into(),
-                            },
-                            placeholder: palette::TEXT_DIM,
-                            value: palette::TEXT_MAIN,
-                            selection: palette::ACCENT_SOFT,
-                            icon: palette::TEXT_DIM,
-                        }),
-                        button(text("Start AI Scan").size(12).color(Color::WHITE))
-                            .on_press(Message::StartAiScan)
-                            .padding([8, 14])
-                            .style(|_: &Theme, _| button::Style {
-                                background: Some(Background::Color(palette::ACCENT)),
-                                border: Border { radius: 6.0.into(), ..Default::default() },
-                                text_color: Color::WHITE,
-                                shadow: Shadow::default(),
-                                snap: false,
-                            }),
-                    ]
-                    .spacing(4)
-                )
-                .padding([8, 0])
             ]
             .spacing(4))
             .padding(10)
@@ -1610,6 +1711,13 @@ impl OtipApp {
                 border: Border{ radius:6.0.into(), ..Default::default()}, text_color: Color::WHITE, shadow: Shadow::default(), snap:false
             });
 
+        // AI Toggle: opens the dedicated AI panel (Gemini key/model/prompt/scan).
+        let ai_btn = button(text("✨ AI").size(11).color(Color::WHITE)).on_press(Message::ToggleAiPanel).padding([6,10])
+            .style(move |_: &Theme, _| button::Style{
+                background: Some(Background::Color(if self.ai_panel_open { palette::ACCENT } else { palette::BTN_BG })),
+                border: Border{ radius:6.0.into(), ..Default::default()}, text_color: Color::WHITE, shadow: Shadow::default(), snap:false
+            });
+
         // Mini/PiP Toggle: desktop approximation (small always-on-top window).
         let pip_label = if self.is_mini { "❐ Exit" } else { "❐ PiP" };
         let pip_btn = button(text(pip_label).size(11).color(Color::WHITE)).on_press(Message::ToggleMini).padding([6,10])
@@ -1635,6 +1743,7 @@ impl OtipApp {
             volume_row,
             cc_btn,
             settings_btn,
+            ai_btn,
             loop_btn,
             speed_menu,
             pip_btn,
@@ -1720,75 +1829,6 @@ impl OtipApp {
                     ]
                     .align_y(Alignment::Center)
                     .spacing(10),
-                    // Gemini API Key Input
-                    row![
-                        text("Gemini API Key").size(12).color(palette::TEXT_MAIN),
-                        text_input(
-                            "Enter your Gemini API key...",
-                            &self.gemini_api_key
-                        )
-                        .on_input(Message::GeminiApiKeyChanged)
-                        .padding(8)
-                        .width(Length::FillPortion(2))
-                        .style(|_: &Theme, _| iced::widget::text_input::Style {
-                            background: Background::Color(palette::BG_ELEVATED),
-                            border: Border {
-                                color: palette::DIVIDER,
-                                width: 1.0,
-                                radius: 6.0.into(),
-                            },
-                            placeholder: palette::TEXT_DIM,
-                            value: palette::TEXT_MAIN,
-                            selection: palette::ACCENT_SOFT,
-                            icon: palette::TEXT_DIM,
-                        }),
-                        Space::new().width(Length::Fixed(8.0)),
-                        text("Get key at aistudio.google.com").size(11).color(palette::TEXT_DIM),
-                    ]
-                    .align_y(Alignment::Center)
-                    .spacing(8),
-                    // Gemini Model Selector
-                    row![
-                        text("Gemini Model").size(12).color(palette::TEXT_MAIN),
-                        pick_list(
-                            &GEMINI_MODELS[..],
-                            Some(self.gemini_model.as_str()),
-                            |s: &str| Message::GeminiModelSelected(s.to_string()),
-                        )
-                        .placeholder("gemini-3.7-flash")
-                        .width(Length::Fixed(200.0))
-                        .style(dark_pick_list_style()),
-                        text("Model used for AI skip analysis").size(11).color(palette::TEXT_DIM),
-                    ]
-                    .align_y(Alignment::Center)
-                    .spacing(10),
-                    // AI Scan execution bridge: runs Gemini analysis with the
-                    // custom prompt and populates auto-skip regions.
-                    row![
-                        button(text("Start AI Scan").size(12).color(Color::WHITE))
-                            .on_press(Message::StartAiScan)
-                            .padding([8, 14])
-                            .style(|_: &Theme, _| button::Style {
-                                background: Some(Background::Color(palette::ACCENT)),
-                                border: Border { radius: 6.0.into(), ..Default::default() },
-                                text_color: Color::WHITE,
-                                shadow: Shadow::default(),
-                                snap: false,
-                            }),
-                        text(self.status.clone())
-                            .size(11)
-                            .color(if self.status_is_error { palette::ALERT } else { palette::TEXT_DIM }),
-                        Space::new().width(Length::Fill),
-                        text(if self.unsafe_segments.is_empty() {
-                            "No skip segments yet".to_string()
-                        } else {
-                            format!("{} skip segment(s)", self.unsafe_segments.len())
-                        })
-                        .size(11)
-                        .color(palette::TEXT_DIM),
-                    ]
-                    .align_y(Alignment::Center)
-                    .spacing(10),
                 ]
                 .spacing(8),
             )
@@ -1810,7 +1850,10 @@ impl OtipApp {
             Space::new().height(Length::Fixed(0.0)).into()
         };
 
-        let player_stack = column![stacked_video, settings_panel, overlay_controls].spacing(0).width(Length::Fill).height(Length::Fill);
+        // Dedicated AI panel overlay (toggled via ✨ AI button).
+        let ai_panel = self.view_ai_panel();
+
+        let player_stack = column![stacked_video, settings_panel, ai_panel, overlay_controls].spacing(0).width(Length::Fill).height(Length::Fill);
 
         // Wrap entire player in mouse_area to capture mouse movement for auto-hide
         mouse_area(player_stack).on_move(|_| Message::MouseMoved).into()
@@ -1822,7 +1865,7 @@ const SPEED_OPTIONS: [&str; 4] = ["0.5x", "1.0x", "1.5x", "2.0x"];
 
 /// Gemini models available for selection.
 const GEMINI_MODELS: [&str; 4] = [
-    "gemini-3.7-flash",
+    "gemini-3.8-flash",
     "gemini-2.0-flash",
     "gemini-1.5-flash-latest",
     "gemini-3.5-flash-lite",

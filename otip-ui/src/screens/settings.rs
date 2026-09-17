@@ -17,7 +17,7 @@ pub enum GeminiModelOpt {
 impl GeminiModelOpt {
     pub fn id(&self) -> &'static str {
         match self {
-            Self::Flash37 => "gemini-3.7-flash",
+            Self::Flash37 => "gemini-3.8-flash",
             Self::FlashLite35 => "gemini-3.5-flash-lite",
         }
     }
@@ -36,7 +36,7 @@ impl GeminiModelOpt {
 impl std::fmt::Display for GeminiModelOpt {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Flash37 => write!(f, "Gemini 3.7 Flash"),
+            Self::Flash37 => write!(f, "Gemini 3.8 Flash"),
             Self::FlashLite35 => write!(f, "Gemini 3.5 Flash Lite"),
         }
     }

@@ -870,7 +870,7 @@ mod tests {
         let segs = run_ai_scan(
             PathBuf::from("/tmp/otip-test-video.mp4"),
             String::new(),
-            "gemini-3.7-flash".to_string(),
+            "gemini-3.8-flash".to_string(),
             "skip ads".to_string(),
         )
         .await;

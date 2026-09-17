@@ -21,14 +21,14 @@ pub struct AppConfig {
 }
 
 /// Supported Gemini models exposed to UI - mirrors otip-ai
-pub const GEMINI_37_FLASH: &str = "gemini-3.7-flash";
+pub const GEMINI_37_FLASH: &str = "gemini-3.8-flash";
 pub const GEMINI_35_FLASH_LITE: &str = "gemini-3.5-flash-lite";
 pub const GEMINI_AVAILABLE_MODELS: &[&str] = &[GEMINI_37_FLASH, GEMINI_35_FLASH_LITE];
 pub const GEMINI_DEFAULT_MODEL: &str = GEMINI_37_FLASH;
 
 pub fn gemini_model_label(model_id: &str) -> &str {
     match model_id {
-        GEMINI_37_FLASH => "Gemini 3.7 Flash",
+        GEMINI_37_FLASH => "Gemini 3.8 Flash",
         GEMINI_35_FLASH_LITE => "Gemini 3.5 Flash Lite",
         "gemini-1.5-flash-latest" => "Gemini 1.5 Flash (legacy)",
         "gemini-2.0-flash" => "Gemini 2.0 Flash",
