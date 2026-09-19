@@ -15,7 +15,7 @@ use iced::{
     window,
 };
 use iced::widget::image::Handle;
-use otip_core::domain::{PlaybackMode, PlaybackState};
+use otip_core::domain::PlaybackMode;
 use otip_core::timeline::format_duration_short;
 use tracing_subscriber::EnvFilter;
 use video_player::{ChapterInfo, PlayerEvent, RenderQuality, SubTrackInfo, VideoPlayerHandle};
@@ -56,13 +56,26 @@ pub mod palette {
     pub const WARN: Color = Color { r: 1.0, g: 0.76, b: 0.03, a: 1.0 }; // #FFC208 amber
     pub const WARN_DIM: Color = Color { r: 1.0, g: 0.76, b: 0.03, a: 0.18 };
 
+    // ── Professional Otip Design System additions ──
+    pub const SAFE_GREEN: Color = Color { r: 0.0627, g: 0.7255, b: 0.5059, a: 1.0 }; // #10B981 Emerald safe buffer
+    pub const SAFE_GREEN_DIM: Color = Color { r: 0.0627, g: 0.7255, b: 0.5059, a: 0.22 };
+    pub const SKIP_RED: Color = Color { r: 0.9569, g: 0.2471, b: 0.3686, a: 1.0 }; // #F43F5E Crimson auto-skip segment
+    pub const SKIP_RED_DIM: Color = Color { r: 0.9569, g: 0.2471, b: 0.3686, a: 0.28 };
+    pub const UNSCANNED_GRAY: Color = Color { r: 0.2471, g: 0.2471, b: 0.2745, a: 0.85 }; // #3F3F46 Unscanned timeline
+    pub const AI_PURPLE: Color = Color { r: 0.6588, g: 0.3333, b: 0.9686, a: 1.0 }; // #A855F7 Gemini AI purple
+    pub const AI_PURPLE_DIM: Color = Color { r: 0.6588, g: 0.3333, b: 0.9686, a: 0.20 };
+    pub const SURFACE_CARD: Color = Color { r: 0.1176, g: 0.1176, b: 0.1255, a: 1.0 }; // #1E1E20 Elevated card surface
+    pub const SURFACE_DOCK: Color = Color { r: 0.09, g: 0.09, b: 0.10, a: 0.95 }; // Translucent glass dock
+    pub const BORDER_CARD: Color = Color { r: 1.0, g: 1.0, b: 1.0, a: 0.08 };
+    pub const BORDER_CARD_HOVER: Color = Color { r: 0.2431, g: 0.6510, b: 1.0, a: 0.45 };
+
     // Alpha variants (same hues, translucent over the main background).
     pub const BAR_BG: Color = Color { r: 0.1294, g: 0.1294, b: 0.1294, a: 0.92 }; // elevated control bar
     pub const PANEL_BG: Color = Color { r: 0.1294, g: 0.1294, b: 0.1294, a: 0.96 }; // popup panels
     pub const BTN_BG: Color = Color { r: 0.1882, g: 0.1882, b: 0.1882, a: 0.9 }; // buttons
     pub const BTN_BG_SOFT: Color = Color { r: 0.1882, g: 0.1882, b: 0.1882, a: 0.85 }; // subtle buttons
     pub const ACCENT_SOFT: Color = Color { r: 0.2431, g: 0.6510, b: 1.0, a: 0.55 }; // buffered strip
-    pub const SCRIM: Color = Color { r: 0.0, g: 0.0, b: 0.0, a: 0.55 }; // overlay scrim
+    pub const SCRIM: Color = Color { r: 0.0, g: 0.0, b: 0.0, a: 0.70 }; // overlay scrim
     pub const DIVIDER: Color = Color { r: 1.0, g: 1.0, b: 1.0, a: 0.10 }; // borders on dark
     pub const TRACK_BG: Color = Color { r: 1.0, g: 1.0, b: 1.0, a: 0.08 }; // slider/empty track
     pub const MARKER_IDLE: Color = Color { r: 1.0, g: 1.0, b: 1.0, a: 0.22 }; // inactive chapter marks
@@ -83,6 +96,11 @@ pub enum Message {
     FolderSelected(Option<PathBuf>),
     LibraryScanned(Vec<PathBuf>),
     VideoSelected(PathBuf),
+    OpenFile, // Trigger native open video file dialog
+    SearchQueryChanged(String), // Library real-time search filter
+    SelectVideoWithMode(PathBuf, PlaybackMode), // Start video directly with selected mode
+    OpenPreplayDialog(PathBuf), // Open the Pre-play Mode selection dialog
+    ClosePreplayDialog, // Dismiss the Pre-play dialog
     OpenUrlDialog, // show the network-stream URL input panel
     UrlInputChanged(String), // URL text field edits
     AiPromptChanged(String), // AI skip prompt text field edits
@@ -146,6 +164,9 @@ pub struct OtipApp {
     library_folder: Option<PathBuf>,
     library_videos: Vec<PathBuf>,
     thumbnails: HashMap<PathBuf, Handle>, // in-memory cache + temp file fallback
+    search_query: String, // Real-time library search
+    preplay_dialog_open: bool, // Pre-play mode selection modal
+    preplay_target: Option<PathBuf>, // Target video for pre-play mode selection
     selected_video_path: Option<PathBuf>,
     stream_title: Option<String>, // playing URL when source is a network stream
     url_dialog_open: bool, // network-stream URL input panel visible
@@ -199,6 +220,9 @@ impl OtipApp {
                 library_folder: None,
                 library_videos: Vec::new(),
                 thumbnails: HashMap::new(),
+                search_query: String::new(),
+                preplay_dialog_open: false,
+                preplay_target: None,
                 selected_video_path: None,
                 stream_title: None,
                 url_dialog_open: false,
@@ -318,6 +342,40 @@ impl OtipApp {
                     return Task::perform(scan_default_media_dirs(), Message::LibraryScanned);
                 }
                 Task::none()
+            }
+            Message::OpenFile => Task::perform(
+                async {
+                    rfd::AsyncFileDialog::new()
+                        .set_title("Open Video File")
+                        .add_filter(
+                            "Video Files",
+                            &["mp4", "mkv", "avi", "mov", "webm", "flv", "wmv", "m4v", "mpg", "mpeg"],
+                        )
+                        .pick_file()
+                        .await
+                        .map(|h| h.path().to_path_buf())
+                },
+                Message::FileSelected,
+            ),
+            Message::SearchQueryChanged(query) => {
+                self.search_query = query;
+                Task::none()
+            }
+            Message::OpenPreplayDialog(path) => {
+                self.preplay_target = Some(path);
+                self.preplay_dialog_open = true;
+                Task::none()
+            }
+            Message::ClosePreplayDialog => {
+                self.preplay_dialog_open = false;
+                self.preplay_target = None;
+                Task::none()
+            }
+            Message::SelectVideoWithMode(path, mode) => {
+                self.playback_mode = mode;
+                self.preplay_dialog_open = false;
+                self.preplay_target = None;
+                self.update(Message::VideoSelected(path))
             }
             Message::LibraryScanned(videos) => {
                 // 3. State Update: persist videos and trigger UI refresh immediately
@@ -963,7 +1021,7 @@ impl OtipApp {
                     // If we didn't skip but were inside a segment, reset last_skip when leaving
                     if !skipped {
                         // Check if we just left a segment
-                        for (seg_start, seg_end) in &self.unsafe_segments {
+                        for (seg_start, _seg_end) in &self.unsafe_segments {
                             if self.position < *seg_start && self.last_skip >= *seg_start {
                                 self.last_skip = Duration::ZERO;
                             }
@@ -1106,17 +1164,125 @@ impl OtipApp {
         ))
     }
 
-    fn view_title_bar(&self) -> Element<Message> {
-        // Redesigned title bar: logo mark left, title center, styled window chrome right
+    fn view_title_bar(&self) -> Element<'_, Message> {
+        // App branding: glowing diamond + OTIP + badge
         let logo = row![
-            text("◈").size(14).color(palette::ACCENT),
-            text("Otip").size(13).color(palette::TEXT_MAIN),
-        ].spacing(6).align_y(Alignment::Center);
+            text("◈").size(15).color(palette::ACCENT),
+            text("OTIP").size(13).color(palette::TEXT_MAIN),
+            container(text("LOOKAHEAD AI").size(9).color(palette::ACCENT))
+                .padding([2, 6])
+                .style(|_: &Theme| container::Style {
+                    background: Some(Background::Color(palette::ACCENT_DIM)),
+                    border: Border {
+                        radius: 4.0.into(),
+                        color: palette::ACCENT,
+                        width: 1.0,
+                    },
+                    shadow: Shadow::default(),
+                    text_color: None,
+                    snap: false,
+                }),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center);
 
-        let title_text = text(self.title()).size(11).color(palette::TEXT_DIM);
+        // Dynamic breadcrumb / status chip based on current screen
+        let center_badge: Element<'_, Message> = match self.screen {
+            AppScreen::Splash => container(
+                row![
+                    text("⚡").size(11),
+                    text("Welcome & Setup").size(11).color(palette::TEXT_DIM),
+                ]
+                .spacing(4)
+                .align_y(Alignment::Center),
+            )
+            .padding([3, 10])
+            .style(|_: &Theme| container::Style {
+                background: Some(Background::Color(palette::SURFACE)),
+                border: Border { radius: 12.0.into(), color: palette::BORDER_CARD, width: 1.0 },
+                shadow: Shadow::default(),
+                text_color: None,
+                snap: false,
+            })
+            .into(),
+            AppScreen::Library => {
+                let count_str = format!("{} videos", self.library_videos.len());
+                container(
+                    row![
+                        text("📂").size(11),
+                        text("Media Library").size(11).color(palette::TEXT_MAIN),
+                        text("•").size(9).color(palette::TEXT_DIM),
+                        text(count_str).size(10).color(palette::TEXT_DIM),
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center),
+                )
+                .padding([3, 10])
+                .style(|_: &Theme| container::Style {
+                    background: Some(Background::Color(palette::SURFACE)),
+                    border: Border { radius: 12.0.into(), color: palette::BORDER_CARD, width: 1.0 },
+                    shadow: Shadow::default(),
+                    text_color: None,
+                    snap: false,
+                })
+                .into()
+            }
+            AppScreen::Player => {
+                let name = self
+                    .selected_video_path
+                    .as_ref()
+                    .and_then(|p| p.file_name())
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.to_string())
+                    .or_else(|| self.stream_title.clone())
+                    .unwrap_or_else(|| "Media Stream".into());
+                let (mode_icon, mode_txt, mode_col) = match self.playback_mode {
+                    PlaybackMode::SafeMode => ("🛡", "Safe Mode", palette::SAFE_GREEN),
+                    PlaybackMode::InstantPlay => ("⚡", "Instant Play", palette::WARN),
+                    PlaybackMode::AutoSkip => ("🤖", "Auto-Skip", palette::ACCENT),
+                };
+                container(
+                    row![
+                        text("🎬").size(11),
+                        text(name).size(11).color(palette::TEXT_MAIN),
+                        container(
+                            row![
+                                text(mode_icon).size(10),
+                                text(mode_txt).size(10).color(mode_col),
+                            ]
+                            .spacing(4)
+                            .align_y(Alignment::Center),
+                        )
+                        .padding([2, 6])
+                        .style(move |_: &Theme| container::Style {
+                            background: Some(Background::Color(match self.playback_mode {
+                                PlaybackMode::SafeMode => palette::SAFE_GREEN_DIM,
+                                PlaybackMode::InstantPlay => palette::WARN_DIM,
+                                PlaybackMode::AutoSkip => palette::ACCENT_DIM,
+                            })),
+                            border: Border { radius: 10.0.into(), color: mode_col, width: 1.0 },
+                            shadow: Shadow::default(),
+                            text_color: None,
+                            snap: false,
+                        }),
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
+                )
+                .padding([3, 10])
+                .style(|_: &Theme| container::Style {
+                    background: Some(Background::Color(palette::SURFACE)),
+                    border: Border { radius: 12.0.into(), color: palette::BORDER_CARD, width: 1.0 },
+                    shadow: Shadow::default(),
+                    text_color: None,
+                    snap: false,
+                })
+                .into()
+            }
+        };
 
-        // Window chrome buttons with hover feedback
-        let minimize_btn = button(text("─").size(11).color(palette::TEXT_DIM))
+        // Window controls
+        let minimize_btn = button(text("─").size(10).color(palette::TEXT_DIM))
             .padding([4, 10])
             .style(|_: &Theme, status| button::Style {
                 background: Some(Background::Color(match status {
@@ -1130,7 +1296,7 @@ impl OtipApp {
             })
             .on_press(Message::MinimizeWindow);
 
-        let maximize_btn = button(text("□").size(11).color(palette::TEXT_DIM))
+        let maximize_btn = button(text("□").size(10).color(palette::TEXT_DIM))
             .padding([4, 10])
             .style(|_: &Theme, status| button::Style {
                 background: Some(Background::Color(match status {
@@ -1144,7 +1310,7 @@ impl OtipApp {
             })
             .on_press(Message::MaximizeWindow);
 
-        let close_btn = button(text("✕").size(11).color(palette::TEXT_DIM))
+        let close_btn = button(text("✕").size(10).color(palette::TEXT_DIM))
             .on_press(Message::CloseWindow)
             .padding([4, 10])
             .style(|_: &Theme, status| button::Style {
@@ -1165,24 +1331,24 @@ impl OtipApp {
         container(
             row![
                 logo,
-                Space::new().width(Length::Fixed(16.0)),
-                title_text,
+                Space::new().width(Length::Fill),
+                center_badge,
                 Space::new().width(Length::Fill),
                 minimize_btn,
                 maximize_btn,
                 close_btn,
             ]
             .align_y(Alignment::Center)
-            .spacing(2),
+            .spacing(4),
         )
         .width(Length::Fill)
-        .height(Length::Fixed(36.0))
-        .padding([0, 12])
+        .height(Length::Fixed(38.0))
+        .padding([0, 14])
         .style(|_: &Theme| container::Style {
             background: Some(Background::Color(palette::BG_MAIN)),
             border: Border {
-                color: palette::BORDER_SUBTLE,
-                width: 0.0,
+                color: palette::BORDER_CARD,
+                width: 1.0,
                 radius: 0.0.into(),
             },
             shadow: Shadow::default(),
@@ -1192,88 +1358,332 @@ impl OtipApp {
         .into()
     }
 
-    fn view(&self) -> Element<Message> {
+    fn view(&self) -> Element<'_, Message> {
         let content = match self.screen {
             AppScreen::Splash => self.view_splash(),
             AppScreen::Library => self.view_library(),
             AppScreen::Player => self.view_player(),
         };
-        // Wrap with custom title bar so CloseRequested is always accessible and subscription cleanup is natural
         let title_bar = self.view_title_bar();
-        let inner: Element<Message> = container(content)
+
+        let base_view = column![title_bar, content]
             .width(Length::Fill)
-            .height(Length::Fill)
-            .padding(20)
-            .style(|_: &Theme| container::Style {
-                background: Some(Background::Color(palette::BG_MAIN)),
-                border: Border::default(),
-                shadow: Shadow::default(),
-                text_color: Some(palette::TEXT_MAIN),
-                snap: false,
-            })
-            .into();
-        column![title_bar, inner]
+            .height(Length::Fill);
+
+        if self.preplay_dialog_open {
+            stack![
+                container(base_view).width(Length::Fill).height(Length::Fill),
+                self.view_preplay_dialog(),
+            ]
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
+        } else {
+            base_view.into()
+        }
     }
 
-    fn view_splash(&self) -> Element<Message> {
-        // ── Premium hero section ──
-        let logo_mark = text("◈").size(48).color(palette::ACCENT);
-        let title = text("Otip").size(72).color(palette::TEXT_MAIN);
-        let subtitle = text("AI-Powered Lookahead Content Moderator")
-            .size(18)
-            .color(palette::TEXT_DIM);
-        let description = text("Scans upcoming scenes · Skips explicit content · Zero file modification")
+    fn view_preplay_dialog(&self) -> Element<'_, Message> {
+        let target_name = self
+            .preplay_target
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or("Selected Video");
+        let target_path = self.preplay_target.clone().unwrap_or_default();
+
+        let header = column![
+            row![
+                text("🛡").size(20),
+                text("Select Content Protection Mode").size(18).color(palette::TEXT_MAIN),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+            text(format!("Media: {}", target_name)).size(12).color(palette::ACCENT),
+            text("Choose how Otip should moderate scenes before playback begins:")
+                .size(12)
+                .color(palette::TEXT_DIM),
+        ]
+        .spacing(6);
+
+        // Safe Mode Card
+        let path_safe = target_path.clone();
+        let safe_card = container(
+            column![
+                row![
+                    text("🛡").size(18),
+                    column![
+                        text("Safe Mode (Full Pre-Scan)").size(14).color(palette::SAFE_GREEN),
+                        text("Recommended for family & public viewing").size(10).color(palette::TEXT_DIM),
+                    ]
+                    .spacing(2),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+                Space::new().height(Length::Fixed(6.0)),
+                text("• Wait for full video scan before playback begins").size(11).color(palette::TEXT_DIM),
+                text("• 100% guaranteed zero exposure to explicit content").size(11).color(palette::TEXT_DIM),
+                text("• Entire seek bar is verified safe with clear skip cuts").size(11).color(palette::TEXT_DIM),
+                Space::new().height(Length::Fixed(10.0)),
+                button(
+                    container(text("▶ Play in Safe Mode").size(12).color(Color::WHITE))
+                        .center_x(Length::Fill),
+                )
+                .on_press(Message::SelectVideoWithMode(path_safe, PlaybackMode::SafeMode))
+                .padding([10, 16])
+                .width(Length::Fill)
+                .style(|_: &Theme, s| button::Style {
+                    background: Some(Background::Color(match s {
+                        button::Status::Hovered => Color::from_rgb(0.08, 0.85, 0.58),
+                        _ => palette::SAFE_GREEN,
+                    })),
+                    border: Border { radius: 8.0.into(), ..Default::default() },
+                    text_color: Color::WHITE,
+                    shadow: Shadow::default(),
+                    snap: false,
+                }),
+            ]
+            .spacing(4),
+        )
+        .width(Length::FillPortion(1))
+        .padding(16)
+        .style(|_: &Theme| container::Style {
+            background: Some(Background::Color(palette::SURFACE)),
+            border: Border {
+                color: palette::SAFE_GREEN,
+                width: 1.0,
+                radius: 12.0.into(),
+            },
+            shadow: Shadow::default(),
+            text_color: None,
+            snap: false,
+        });
+
+        // Instant Play Card
+        let path_instant = target_path;
+        let instant_card = container(
+            column![
+                row![
+                    text("⚡").size(18),
+                    column![
+                        text("Instant Play (Zero Trust)").size(14).color(palette::WARN),
+                        text("Fastest start with real-time lookahead").size(10).color(palette::TEXT_DIM),
+                    ]
+                    .spacing(2),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+                Space::new().height(Length::Fixed(6.0)),
+                text("• Playback starts immediately with zero wait").size(11).color(palette::TEXT_DIM),
+                text("• Scanning runs in background 30s ahead of playhead").size(11).color(palette::TEXT_DIM),
+                text("• ⚠️ Manual seeking past green buffer enters unscanned scenes").size(11).color(palette::WARN),
+                Space::new().height(Length::Fixed(10.0)),
+                button(
+                    container(text("⚡ Start Instant Play").size(12).color(Color::WHITE))
+                        .center_x(Length::Fill),
+                )
+                .on_press(Message::SelectVideoWithMode(path_instant, PlaybackMode::InstantPlay))
+                .padding([10, 16])
+                .width(Length::Fill)
+                .style(|_: &Theme, s| button::Style {
+                    background: Some(Background::Color(match s {
+                        button::Status::Hovered => Color::from_rgb(1.0, 0.82, 0.15),
+                        _ => palette::WARN,
+                    })),
+                    border: Border { radius: 8.0.into(), ..Default::default() },
+                    text_color: Color::WHITE,
+                    shadow: Shadow::default(),
+                    snap: false,
+                }),
+            ]
+            .spacing(4),
+        )
+        .width(Length::FillPortion(1))
+        .padding(16)
+        .style(|_: &Theme| container::Style {
+            background: Some(Background::Color(palette::SURFACE)),
+            border: Border {
+                color: palette::BORDER_CARD,
+                width: 1.0,
+                radius: 12.0.into(),
+            },
+            shadow: Shadow::default(),
+            text_color: None,
+            snap: false,
+        });
+
+        let cancel_btn = button(text("Cancel").size(11).color(palette::TEXT_DIM))
+            .on_press(Message::ClosePreplayDialog)
+            .padding([6, 16])
+            .style(|_: &Theme, s| button::Style {
+                background: Some(Background::Color(match s {
+                    button::Status::Hovered => palette::BG_HOVER,
+                    _ => Color::TRANSPARENT,
+                })),
+                border: Border { radius: 8.0.into(), ..Default::default() },
+                text_color: palette::TEXT_DIM,
+                shadow: Shadow::default(),
+                snap: false,
+            });
+
+        let dialog_box = container(
+            column![
+                header,
+                Space::new().height(Length::Fixed(12.0)),
+                row![safe_card, instant_card].spacing(14).width(Length::Fill),
+                Space::new().height(Length::Fixed(10.0)),
+                row![Space::new().width(Length::Fill), cancel_btn]
+                    .align_y(Alignment::Center),
+            ]
+            .spacing(4),
+        )
+        .width(Length::Fixed(640.0))
+        .padding(24)
+        .style(|_: &Theme| container::Style {
+            background: Some(Background::Color(palette::BG_ELEVATED)),
+            border: Border {
+                color: palette::BORDER_CARD_HOVER,
+                width: 1.0,
+                radius: 16.0.into(),
+            },
+            shadow: Shadow::default(),
+            text_color: Some(palette::TEXT_MAIN),
+            snap: false,
+        });
+
+        container(dialog_box)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill)
+            .style(|_: &Theme| container::Style {
+                background: Some(Background::Color(palette::SCRIM)),
+                border: Border::default(),
+                shadow: Shadow::default(),
+                text_color: None,
+                snap: false,
+            })
+            .into()
+    }
+
+    fn view_splash(&self) -> Element<'_, Message> {
+        // Hero Brand Badge
+        let badge = container(
+            row![
+                text("◈").size(14).color(palette::ACCENT),
+                text("NEXT-GEN CONTENT MODERATION").size(10).color(palette::ACCENT),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+        )
+        .padding([4, 14])
+        .style(|_: &Theme| container::Style {
+            background: Some(Background::Color(palette::ACCENT_DIM)),
+            border: Border {
+                radius: 20.0.into(),
+                color: palette::ACCENT,
+                width: 1.0,
+            },
+            shadow: Shadow::default(),
+            text_color: None,
+            snap: false,
+        });
+
+        let title = text("Otip").size(68).color(palette::TEXT_MAIN);
+        let subtitle = text("AI-Powered Lookahead Video Player")
+            .size(20)
+            .color(palette::TEXT_MAIN);
+        let description = text("Scans upcoming scenes with Gemini Vision • Automatically skips explicit NSFW content • Zero original video modification")
             .size(13)
             .color(palette::TEXT_DIM);
 
-        let hero = column![logo_mark, title, subtitle, Space::new().height(Length::Fixed(4.0)), description]
+        let hero = column![badge, Space::new().height(Length::Fixed(4.0)), title, subtitle, Space::new().height(Length::Fixed(4.0)), description]
             .align_x(Alignment::Center)
-            .spacing(6);
+            .spacing(4);
 
-        // ── Feature pills ──
-        let pill = |icon: &'static str, label: &'static str, tint: Color, tint_bg: Color| -> Element<Message> {
+        // 3 Feature Cards
+        let feature_card = |icon: &'static str, heading: &'static str, body: &'static str, tag: &'static str, tag_col: Color, tag_bg: Color| -> Element<'_, Message> {
             container(
-                row![
-                    text(icon).size(14),
-                    text(label).size(12).color(tint),
+                column![
+                    row![
+                        text(icon).size(20),
+                        Space::new().width(Length::Fixed(4.0)),
+                        container(text(tag).size(9).color(tag_col))
+                            .padding([2, 8])
+                            .style(move |_: &Theme| container::Style {
+                                background: Some(Background::Color(tag_bg)),
+                                border: Border { radius: 10.0.into(), color: tag_col, width: 1.0 },
+                                shadow: Shadow::default(),
+                                text_color: None,
+                                snap: false,
+                            }),
+                    ]
+                    .align_y(Alignment::Center)
+                    .spacing(6),
+                    Space::new().height(Length::Fixed(4.0)),
+                    text(heading).size(14).color(palette::TEXT_MAIN),
+                    Space::new().height(Length::Fixed(2.0)),
+                    text(body).size(11).color(palette::TEXT_DIM),
                 ]
-                .spacing(6)
-                .align_y(Alignment::Center),
+                .spacing(4),
             )
-            .padding([6, 14])
-            .style(move |_: &Theme| container::Style {
-                background: Some(Background::Color(tint_bg)),
-                border: Border { radius: 20.0.into(), color: tint, width: 1.0 },
+            .width(Length::Fixed(240.0))
+            .padding(16)
+            .style(|_: &Theme| container::Style {
+                background: Some(Background::Color(palette::SURFACE_CARD)),
+                border: Border {
+                    radius: 12.0.into(),
+                    color: palette::BORDER_CARD,
+                    width: 1.0,
+                },
                 shadow: Shadow::default(),
-                text_color: Some(tint),
+                text_color: None,
                 snap: false,
             })
             .into()
         };
-        let pills = row![
-            pill("🛡", "Safe Mode", palette::SUCCESS, palette::SUCCESS_DIM),
-            pill("⚡", "Instant Play", palette::WARN, palette::WARN_DIM),
-            pill("🤖", "AI Auto-Skip", palette::ACCENT, palette::ACCENT_DIM),
+
+        let cards = row![
+            feature_card(
+                "🛡",
+                "Safe Mode",
+                "Full pre-scan of all scenes before play. 100% guaranteed safe for public & classroom use.",
+                "GUARANTEED SAFE",
+                palette::SAFE_GREEN,
+                palette::SAFE_GREEN_DIM
+            ),
+            feature_card(
+                "⚡",
+                "Instant Play",
+                "Starts instantly. Background workers look ahead 30 seconds to buffer safe regions in real-time.",
+                "LIVE LOOKAHEAD",
+                palette::WARN,
+                palette::WARN_DIM
+            ),
+            feature_card(
+                "🤖",
+                "2x2 Grid Vision",
+                "Stitches 4 video frames into 2x2 grids for ultra-fast Gemini inference and millisecond cuts.",
+                "GEMINI FLASH",
+                palette::AI_PURPLE,
+                palette::AI_PURPLE_DIM
+            ),
         ]
-        .spacing(12)
+        .spacing(14)
         .align_y(Alignment::Center);
 
-        // ── CTA button ──
-        let cta = button(
+        // Action Launchpad Buttons
+        let browse_btn = button(
             container(
                 row![
-                    text("Browse Videos").size(16).color(Color::WHITE),
-                    text("→").size(18).color(Color::WHITE),
+                    text("📁").size(15),
+                    text("Browse Video Library").size(14).color(Color::WHITE),
+                    text("→").size(16).color(Color::WHITE),
                 ]
                 .spacing(8)
                 .align_y(Alignment::Center),
             )
-            .padding([14, 32])
-            .center_x(Length::Fill)
-            .width(Length::Fixed(260.0)),
+            .padding([12, 28]),
         )
         .on_press(Message::NavigateTo(AppScreen::Library))
         .padding(0)
@@ -1283,14 +1693,66 @@ impl OtipApp {
                 button::Status::Pressed => palette::ACCENT_PRESSED,
                 _ => palette::ACCENT,
             })),
-            border: Border { radius: 14.0.into(), ..Default::default() },
+            border: Border { radius: 12.0.into(), ..Default::default() },
             text_color: Color::WHITE,
             shadow: Shadow::default(),
             snap: false,
         });
 
-        // ── Footer ──
-        let footer = text("100% Rust · Cross-platform · Privacy-first")
+        let open_file_btn = button(
+            container(
+                row![
+                    text("📂").size(14),
+                    text("Open Video File").size(13).color(palette::TEXT_MAIN),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+            )
+            .padding([12, 22]),
+        )
+        .on_press(Message::OpenFile)
+        .padding(0)
+        .style(|_: &Theme, s| button::Style {
+            background: Some(Background::Color(match s {
+                button::Status::Hovered => palette::BG_HOVER,
+                _ => palette::SURFACE,
+            })),
+            border: Border { radius: 12.0.into(), color: palette::BORDER_CARD, width: 1.0 },
+            text_color: palette::TEXT_MAIN,
+            shadow: Shadow::default(),
+            snap: false,
+        });
+
+        let stream_url_btn = button(
+            container(
+                row![
+                    text("🌐").size(14),
+                    text("Stream URL").size(13).color(palette::TEXT_MAIN),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+            )
+            .padding([12, 20]),
+        )
+        .on_press(Message::OpenUrlDialog)
+        .padding(0)
+        .style(|_: &Theme, s| button::Style {
+            background: Some(Background::Color(match s {
+                button::Status::Hovered => palette::BG_HOVER,
+                _ => palette::SURFACE,
+            })),
+            border: Border { radius: 12.0.into(), color: palette::BORDER_CARD, width: 1.0 },
+            text_color: palette::TEXT_MAIN,
+            shadow: Shadow::default(),
+            snap: false,
+        });
+
+        let action_row = row![browse_btn, open_file_btn, stream_url_btn]
+            .spacing(12)
+            .align_y(Alignment::Center);
+
+        // System Specs Footer
+        let footer = text("100% Pure Rust • GStreamer / libmpv Hardware Decoding • Google Gemini 1.5/3.8 Flash Vision • Zero File Mutation")
             .size(11)
             .color(palette::TEXT_DIM);
 
@@ -1298,16 +1760,16 @@ impl OtipApp {
             column![
                 Space::new().height(Length::FillPortion(2)),
                 hero,
+                Space::new().height(Length::Fixed(24.0)),
+                cards,
                 Space::new().height(Length::Fixed(28.0)),
-                pills,
-                Space::new().height(Length::Fixed(36.0)),
-                cta,
+                action_row,
                 Space::new().height(Length::FillPortion(2)),
                 footer,
-                Space::new().height(Length::Fixed(16.0)),
+                Space::new().height(Length::Fixed(14.0)),
             ]
             .align_x(Alignment::Center)
-            .spacing(8)
+            .spacing(6)
             .width(Length::Fill)
             .height(Length::Fill),
         )
@@ -1318,21 +1780,20 @@ impl OtipApp {
         .into()
     }
 
-    fn view_library(&self) -> Element<Message> {
-        // ── Redesigned Library: polished top bar, glass URL panel, rich video cards ──
+    fn view_library(&self) -> Element<'_, Message> {
         let folder_label = if let Some(folder) = &self.library_folder {
             folder.display().to_string()
         } else if !self.library_videos.is_empty() {
-            format!("Auto-scanned · {} videos", self.library_videos.len())
+            format!("Auto-Scanned • {} videos found", self.library_videos.len())
         } else {
             "No folder selected".to_string()
         };
 
-        // ── Top bar: back button · folder label · URL + Folder actions ──
+        // Navigation bar: Back · Folder path · Search bar · Open File · Select Folder · URL
         let back_btn = button(
             row![
-                text("←").size(14).color(palette::TEXT_DIM),
-                text("Back").size(12).color(palette::TEXT_DIM),
+                text("←").size(13).color(palette::TEXT_DIM),
+                text("Home").size(12).color(palette::TEXT_DIM),
             ]
             .spacing(6)
             .align_y(Alignment::Center),
@@ -1350,22 +1811,61 @@ impl OtipApp {
             snap: false,
         });
 
-        let url_btn = button(
+        // Search Input
+        let search_input = text_input("🔍 Filter videos by title...", &self.search_query)
+            .on_input(Message::SearchQueryChanged)
+            .padding(8)
+            .width(Length::Fixed(240.0))
+            .style(|_: &Theme, _| iced::widget::text_input::Style {
+                background: Background::Color(palette::BG_ELEVATED),
+                border: Border {
+                    color: palette::BORDER_CARD,
+                    width: 1.0,
+                    radius: 8.0.into(),
+                },
+                placeholder: palette::TEXT_DIM,
+                value: palette::TEXT_MAIN,
+                selection: palette::ACCENT_SOFT,
+                icon: palette::TEXT_DIM,
+            });
+
+        let open_file_btn = button(
             row![
-                text("🌐").size(13),
-                text("Open URL").size(12).color(palette::TEXT_MAIN),
+                text("📂").size(12),
+                text("Open File").size(12).color(palette::TEXT_MAIN),
             ]
             .spacing(6)
             .align_y(Alignment::Center),
         )
-        .on_press(Message::OpenUrlDialog)
-        .padding([8, 16])
+        .on_press(Message::OpenFile)
+        .padding([8, 14])
         .style(|_: &Theme, status| button::Style {
             background: Some(Background::Color(match status {
                 button::Status::Hovered => palette::BG_HOVER,
                 _ => palette::BG_ELEVATED,
             })),
-            border: Border { color: palette::BORDER_SUBTLE, width: 1.0, radius: 8.0.into() },
+            border: Border { color: palette::BORDER_CARD, width: 1.0, radius: 8.0.into() },
+            text_color: palette::TEXT_MAIN,
+            shadow: Shadow::default(),
+            snap: false,
+        });
+
+        let url_btn = button(
+            row![
+                text("🌐").size(12),
+                text("Stream URL").size(12).color(palette::TEXT_MAIN),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+        )
+        .on_press(Message::OpenUrlDialog)
+        .padding([8, 14])
+        .style(|_: &Theme, status| button::Style {
+            background: Some(Background::Color(match status {
+                button::Status::Hovered => palette::BG_HOVER,
+                _ => palette::BG_ELEVATED,
+            })),
+            border: Border { color: palette::BORDER_CARD, width: 1.0, radius: 8.0.into() },
             text_color: palette::TEXT_MAIN,
             shadow: Shadow::default(),
             snap: false,
@@ -1373,7 +1873,7 @@ impl OtipApp {
 
         let folder_btn = button(
             row![
-                text("📁").size(13),
+                text("📁").size(12),
                 text("Select Folder").size(12).color(Color::WHITE),
             ]
             .spacing(6)
@@ -1395,21 +1895,29 @@ impl OtipApp {
 
         let top_bar = row![
             back_btn,
+            Space::new().width(Length::Fixed(8.0)),
+            container(text(folder_label).size(11).color(palette::TEXT_DIM))
+                .padding([6, 12])
+                .style(|_: &Theme| container::Style {
+                    background: Some(Background::Color(palette::BG_ELEVATED)),
+                    border: Border { radius: 8.0.into(), color: palette::BORDER_CARD, width: 1.0 },
+                    shadow: Shadow::default(),
+                    text_color: None,
+                    snap: false,
+                }),
             Space::new().width(Length::Fill),
-            text(folder_label.clone()).size(12).color(palette::TEXT_DIM),
-            Space::new().width(Length::Fill),
+            search_input,
+            Space::new().width(Length::Fixed(6.0)),
+            open_file_btn,
             url_btn,
             folder_btn,
         ]
         .align_y(Alignment::Center)
-        .spacing(10)
+        .spacing(6)
         .width(Length::Fill);
 
-        let status_color = if self.status_is_error { palette::ALERT } else { palette::TEXT_DIM };
-        let status = text(&self.status).size(11).color(status_color);
-
-        // ── URL panel (glass-style) ──
-        let url_panel: Element<Message> = if self.url_dialog_open {
+        // URL Dialog
+        let url_panel: Element<'_, Message> = if self.url_dialog_open {
             container(
                 row![
                     text("🌐").size(16),
@@ -1418,21 +1926,19 @@ impl OtipApp {
                         .on_submit(Message::PlayUrl)
                         .padding(10)
                         .width(Length::Fill),
-                    button(
-                        text("Open").size(12).color(Color::WHITE),
-                    )
-                    .on_press(Message::PlayUrl)
-                    .padding([8, 18])
-                    .style(|_: &Theme, status| button::Style {
-                        background: Some(Background::Color(match status {
-                            button::Status::Hovered => palette::ACCENT_HOVER,
-                            _ => palette::ACCENT,
-                        })),
-                        border: Border { radius: 8.0.into(), ..Default::default() },
-                        text_color: Color::WHITE,
-                        shadow: Shadow::default(),
-                        snap: false,
-                    }),
+                    button(text("Open Stream").size(12).color(Color::WHITE))
+                        .on_press(Message::PlayUrl)
+                        .padding([8, 18])
+                        .style(|_: &Theme, status| button::Style {
+                            background: Some(Background::Color(match status {
+                                button::Status::Hovered => palette::ACCENT_HOVER,
+                                _ => palette::ACCENT,
+                            })),
+                            border: Border { radius: 8.0.into(), ..Default::default() },
+                            text_color: Color::WHITE,
+                            shadow: Shadow::default(),
+                            snap: false,
+                        }),
                     button(text("✕").size(12).color(palette::TEXT_DIM))
                         .on_press(Message::CloseUrlDialog)
                         .padding([8, 12])
@@ -1455,7 +1961,7 @@ impl OtipApp {
             .style(|_: &Theme| container::Style {
                 background: Some(Background::Color(palette::SURFACE)),
                 border: Border {
-                    color: palette::BORDER_SUBTLE,
+                    color: palette::BORDER_CARD_HOVER,
                     width: 1.0,
                     radius: 12.0.into(),
                 },
@@ -1468,16 +1974,35 @@ impl OtipApp {
             Space::new().height(Length::Fixed(0.0)).into()
         };
 
-        // ── Video card list ──
-        let grid: Element<Message> = if self.library_videos.is_empty() {
+        // Filter videos by search query
+        let query = self.search_query.trim().to_lowercase();
+        let filtered_videos: Vec<&PathBuf> = self
+            .library_videos
+            .iter()
+            .filter(|p| {
+                if query.is_empty() {
+                    return true;
+                }
+                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_lowercase();
+                name.contains(&query)
+            })
+            .collect();
+
+        let grid: Element<'_, Message> = if filtered_videos.is_empty() {
             container(
                 column![
-                    text("📂").size(36),
-                    Space::new().height(Length::Fixed(12.0)),
-                    text("No videos found").size(18).color(palette::TEXT_MAIN),
-                    Space::new().height(Length::Fixed(6.0)),
-                    text("Select a folder or auto-scan will check Videos and Downloads")
-                        .size(13)
+                    text("🎬").size(40),
+                    Space::new().height(Length::Fixed(10.0)),
+                    text(if self.library_videos.is_empty() {
+                        "No videos in library"
+                    } else {
+                        "No videos match your search"
+                    })
+                    .size(16)
+                    .color(palette::TEXT_MAIN),
+                    Space::new().height(Length::Fixed(4.0)),
+                    text("Click 'Select Folder' to load a folder or 'Open File' to play any video directly.")
+                        .size(12)
                         .color(palette::TEXT_DIM),
                 ]
                 .align_x(Alignment::Center),
@@ -1488,32 +2013,55 @@ impl OtipApp {
             .center_y(Length::Fill)
             .into()
         } else {
-            let video_list: Vec<Element<Message>> = self
-                .library_videos
-                .iter()
+            let video_list: Vec<Element<'_, Message>> = filtered_videos
+                .into_iter()
                 .map(|path| {
                     let name = path
                         .file_name()
                         .and_then(|n| n.to_str())
                         .unwrap_or("video")
                         .to_string();
+                    let ext = path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("MP4")
+                        .to_uppercase();
+                    let parent_name = path
+                        .parent()
+                        .and_then(|d| d.file_name())
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("")
+                        .to_string();
                     let p = path.clone();
 
-                    // Thumbnail or placeholder
-                    let thumb: Element<Message> = if let Some(handle) = self.thumbnails.get(path) {
+                    // Thumbnail preview container
+                    let thumb: Element<'_, Message> = if let Some(handle) = self.thumbnails.get(path) {
                         container(
-                            image(handle.clone())
-                                .width(Length::Fixed(180.0))
-                                .height(Length::Fixed(100.0)),
+                            stack![
+                                image(handle.clone())
+                                    .width(Length::Fixed(190.0))
+                                    .height(Length::Fixed(106.0)),
+                                container(text(ext.clone()).size(9).color(Color::WHITE))
+                                    .padding([2, 6])
+                                    .align_x(Alignment::End)
+                                    .align_y(Alignment::Start)
+                                    .style(|_: &Theme| container::Style {
+                                        background: Some(Background::Color(Color { r: 0.0, g: 0.0, b: 0.0, a: 0.75 })),
+                                        border: Border { radius: 4.0.into(), ..Default::default() },
+                                        shadow: Shadow::default(),
+                                        text_color: None,
+                                        snap: false,
+                                    }),
+                            ],
                         )
-                        .width(Length::Fixed(180.0))
-                        .height(Length::Fixed(100.0))
+                        .width(Length::Fixed(190.0))
+                        .height(Length::Fixed(106.0))
                         .style(|_: &Theme| container::Style {
                             background: Some(Background::Color(palette::BG_MAIN)),
                             border: Border {
-                                color: palette::BORDER_SUBTLE,
+                                color: palette::BORDER_CARD,
                                 width: 1.0,
-                                radius: 8.0.into(),
+                                radius: 10.0.into(),
                             },
                             shadow: Shadow::default(),
                             text_color: None,
@@ -1521,59 +2069,136 @@ impl OtipApp {
                         })
                         .into()
                     } else {
-                        container(text("🎬").size(28).color(palette::ACCENT))
-                            .width(Length::Fixed(180.0))
-                            .height(Length::Fixed(100.0))
-                            .center_x(Length::Fill)
-                            .center_y(Length::Fill)
+                        container(
+                            stack![
+                                container(
+                                    column![
+                                        text("🎬").size(26).color(palette::ACCENT),
+                                        text(ext.clone()).size(10).color(palette::TEXT_DIM),
+                                    ]
+                                    .spacing(4)
+                                    .align_x(Alignment::Center),
+                                )
+                                .width(Length::Fill)
+                                .height(Length::Fill)
+                                .center_x(Length::Fill)
+                                .center_y(Length::Fill),
+                            ],
+                        )
+                        .width(Length::Fixed(190.0))
+                        .height(Length::Fixed(106.0))
+                        .style(|_: &Theme| container::Style {
+                            background: Some(Background::Color(palette::BG_ELEVATED)),
+                            border: Border {
+                                color: palette::BORDER_CARD,
+                                width: 1.0,
+                                radius: 10.0.into(),
+                            },
+                            shadow: Shadow::default(),
+                            text_color: None,
+                            snap: false,
+                        })
+                        .into()
+                    };
+
+                    // Video Info section
+                    let info = column![
+                        text(name).size(14).color(palette::TEXT_MAIN),
+                        row![
+                            text("📁").size(11),
+                            text(parent_name).size(11).color(palette::TEXT_DIM),
+                            text("•").size(9).color(palette::TEXT_DIM),
+                            container(
+                                row![
+                                    text("🛡").size(9),
+                                    text("AI Lookahead Ready").size(9).color(palette::SAFE_GREEN),
+                                ]
+                                .spacing(3)
+                                .align_y(Alignment::Center),
+                            )
+                            .padding([2, 6])
                             .style(|_: &Theme| container::Style {
-                                background: Some(Background::Color(palette::BG_ELEVATED)),
-                                border: Border {
-                                    color: palette::BORDER_SUBTLE,
-                                    width: 1.0,
-                                    radius: 8.0.into(),
-                                },
+                                background: Some(Background::Color(palette::SAFE_GREEN_DIM)),
+                                border: Border { radius: 8.0.into(), color: palette::SAFE_GREEN, width: 1.0 },
                                 shadow: Shadow::default(),
                                 text_color: None,
                                 snap: false,
-                            })
-                            .into()
-                    };
-
-                    // File info
-                    let parent_name = p.parent().and_then(|d| d.file_name()).and_then(|n| n.to_str()).unwrap_or("").to_string();
-                    let info = column![
-                        text(name.clone()).size(14).color(palette::TEXT_MAIN),
-                        text(parent_name).size(11).color(palette::TEXT_DIM),
-                    ]
-                    .spacing(4)
-                    .width(Length::Fill);
-
-                    // Play button (pill style)
-                    let play_btn = button(
-                        row![
-                            text("▶").size(12).color(Color::WHITE),
-                            text("Play").size(12).color(Color::WHITE),
+                            }),
                         ]
                         .spacing(6)
                         .align_y(Alignment::Center),
+                    ]
+                    .spacing(6)
+                    .width(Length::Fill);
+
+                    // Dual Play Action Buttons
+                    let p_safe = p.clone();
+                    let safe_btn = button(
+                        row![
+                            text("🛡").size(11),
+                            text("Safe Play").size(11).color(Color::WHITE),
+                        ]
+                        .spacing(5)
+                        .align_y(Alignment::Center),
                     )
-                    .on_press(Message::VideoSelected(p.clone()))
-                    .padding([8, 18])
+                    .on_press(Message::SelectVideoWithMode(p_safe, PlaybackMode::SafeMode))
+                    .padding([7, 14])
                     .style(|_: &Theme, status| button::Style {
                         background: Some(Background::Color(match status {
-                            button::Status::Hovered => palette::ACCENT_HOVER,
-                            _ => palette::ACCENT,
+                            button::Status::Hovered => Color::from_rgb(0.08, 0.85, 0.58),
+                            _ => palette::SAFE_GREEN,
                         })),
-                        border: Border { radius: 20.0.into(), ..Default::default() },
+                        border: Border { radius: 16.0.into(), ..Default::default() },
                         text_color: Color::WHITE,
                         shadow: Shadow::default(),
                         snap: false,
                     });
 
+                    let p_instant = p.clone();
+                    let instant_btn = button(
+                        row![
+                            text("⚡").size(11),
+                            text("Instant").size(11).color(palette::TEXT_MAIN),
+                        ]
+                        .spacing(5)
+                        .align_y(Alignment::Center),
+                    )
+                    .on_press(Message::SelectVideoWithMode(p_instant, PlaybackMode::InstantPlay))
+                    .padding([7, 12])
+                    .style(|_: &Theme, status| button::Style {
+                        background: Some(Background::Color(match status {
+                            button::Status::Hovered => palette::BG_HOVER,
+                            _ => palette::BG_ELEVATED,
+                        })),
+                        border: Border { color: palette::BORDER_CARD, width: 1.0, radius: 16.0.into() },
+                        text_color: palette::TEXT_MAIN,
+                        shadow: Shadow::default(),
+                        snap: false,
+                    });
+
+                    let prompt_btn = button(
+                        text("⋯").size(14).color(palette::TEXT_DIM),
+                    )
+                    .on_press(Message::OpenPreplayDialog(p))
+                    .padding([7, 10])
+                    .style(|_: &Theme, status| button::Style {
+                        background: Some(Background::Color(match status {
+                            button::Status::Hovered => palette::BG_HOVER,
+                            _ => Color::TRANSPARENT,
+                        })),
+                        border: Border { radius: 8.0.into(), ..Default::default() },
+                        text_color: palette::TEXT_DIM,
+                        shadow: Shadow::default(),
+                        snap: false,
+                    });
+
+                    let actions = row![safe_btn, instant_btn, prompt_btn]
+                        .spacing(6)
+                        .align_y(Alignment::Center);
+
                     // Card container
                     container(
-                        row![thumb, info, play_btn]
+                        row![thumb, info, actions]
                             .align_y(Alignment::Center)
                             .spacing(16)
                             .width(Length::Fill)
@@ -1581,11 +2206,11 @@ impl OtipApp {
                     )
                     .width(Length::Fill)
                     .style(|_: &Theme| container::Style {
-                        background: Some(Background::Color(palette::SURFACE)),
+                        background: Some(Background::Color(palette::SURFACE_CARD)),
                         border: Border {
-                            color: palette::BORDER_SUBTLE,
+                            color: palette::BORDER_CARD,
                             width: 1.0,
-                            radius: 10.0.into(),
+                            radius: 12.0.into(),
                         },
                         shadow: Shadow::default(),
                         text_color: None,
@@ -1594,20 +2219,28 @@ impl OtipApp {
                     .into()
                 })
                 .collect();
-            scrollable(column(video_list).spacing(8).padding(4))
+
+            scrollable(column(video_list).spacing(10).padding(4))
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into()
         };
 
-        // ── Assemble library ──
+        let status_color = if self.status_is_error { palette::ALERT } else { palette::TEXT_DIM };
+        let status_bar = row![
+            text("●").size(9).color(if self.status_is_error { palette::ALERT } else { palette::ACCENT }),
+            text(&self.status).size(11).color(status_color),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center);
+
         container(
             column![
                 top_bar,
                 url_panel,
-                Space::new().height(Length::Fixed(10.0)),
-                status,
-                Space::new().height(Length::Fixed(8.0)),
+                Space::new().height(Length::Fixed(6.0)),
+                status_bar,
+                Space::new().height(Length::Fixed(6.0)),
                 grid,
             ]
             .spacing(4),
@@ -1625,39 +2258,71 @@ impl OtipApp {
         .into()
     }
 
-    fn view_ai_panel(&self) -> Element<Message> {
+    fn view_ai_panel(&self) -> Element<'_, Message> {
         if !self.ai_panel_open {
             return Space::new().height(Length::Fixed(0.0)).into();
         }
 
-        // Section header with accent line
+        // Section header with purple AI accent bar
         let header = row![
             container(
-                Space::new().width(Length::Fixed(3.0)).height(Length::Fixed(18.0)),
+                Space::new().width(Length::Fixed(4.0)).height(Length::Fixed(20.0)),
             )
             .style(|_: &Theme| container::Style {
-                background: Some(Background::Color(palette::ACCENT)),
+                background: Some(Background::Color(palette::AI_PURPLE)),
                 border: Border { radius: 2.0.into(), ..Default::default() },
                 shadow: Shadow::default(),
                 text_color: None,
                 snap: false,
             }),
-            text("AI Content Scan").size(14).color(palette::TEXT_MAIN),
+            text("✨ Gemini Vision Lookahead Moderator").size(15).color(palette::TEXT_MAIN),
+            Space::new().width(Length::Fill),
+            container(
+                row![
+                    text("●").size(8).color(if self.gemini_api_key.trim().is_empty() { palette::WARN } else { palette::SAFE_GREEN }),
+                    text(if self.gemini_api_key.trim().is_empty() { "API Key Required" } else { "Gemini Ready" })
+                        .size(10)
+                        .color(palette::TEXT_DIM),
+                ]
+                .spacing(5)
+                .align_y(Alignment::Center),
+            )
+            .padding([2, 8])
+            .style(|_: &Theme| container::Style {
+                background: Some(Background::Color(palette::BG_ELEVATED)),
+                border: Border { radius: 10.0.into(), color: palette::BORDER_CARD, width: 1.0 },
+                shadow: Shadow::default(),
+                text_color: None,
+                snap: false,
+            }),
+            button(text("✕").size(11).color(palette::TEXT_DIM))
+                .on_press(Message::ToggleAiPanel)
+                .padding([4, 8])
+                .style(|_: &Theme, s| button::Style {
+                    background: Some(Background::Color(match s {
+                        button::Status::Hovered => palette::BG_HOVER,
+                        _ => Color::TRANSPARENT,
+                    })),
+                    border: Border { radius: 4.0.into(), ..Default::default() },
+                    text_color: palette::TEXT_DIM,
+                    shadow: Shadow::default(),
+                    snap: false,
+                }),
         ]
-        .spacing(10)
+        .spacing(8)
         .align_y(Alignment::Center);
 
         // API Key row
         let api_key_row = row![
-            text("API Key").size(12).color(palette::TEXT_DIM),
-            text_input("Enter your Gemini API key...", &self.gemini_api_key)
+            text("Gemini API Key").size(12).color(palette::TEXT_DIM),
+            text_input("AIzaSy... (get free key at aistudio.google.com)", &self.gemini_api_key)
                 .on_input(Message::GeminiApiKeyChanged)
-                .padding(10)
+                .padding(9)
                 .width(Length::FillPortion(2))
                 .style(|_: &Theme, _| iced::widget::text_input::Style {
                     background: Background::Color(palette::BG_ELEVATED),
                     border: Border {
-                        color: palette::BORDER_SUBTLE,
+                        color: palette::BORDER_CARD,
                         width: 1.0,
                         radius: 8.0.into(),
                     },
@@ -1666,40 +2331,48 @@ impl OtipApp {
                     selection: palette::ACCENT_SOFT,
                     icon: palette::TEXT_DIM,
                 }),
-            text("aistudio.google.com").size(10).color(palette::TEXT_DIM),
+            container(text("aistudio.google.com").size(10).color(palette::ACCENT))
+                .padding([4, 8])
+                .style(|_: &Theme| container::Style {
+                    background: Some(Background::Color(palette::ACCENT_DIM)),
+                    border: Border { radius: 6.0.into(), ..Default::default() },
+                    shadow: Shadow::default(),
+                    text_color: None,
+                    snap: false,
+                }),
         ]
         .align_y(Alignment::Center)
         .spacing(10);
 
         // Model selector row
         let model_row = row![
-            text("Model").size(12).color(palette::TEXT_DIM),
+            text("Vision Model").size(12).color(palette::TEXT_DIM),
             pick_list(
                 &GEMINI_MODELS[..],
                 Some(self.gemini_model.as_str()),
                 |s: &str| Message::GeminiModelSelected(s.to_string()),
             )
             .placeholder("gemini-3.8-flash")
-            .width(Length::Fixed(200.0))
+            .width(Length::Fixed(220.0))
             .style(dark_pick_list_style()),
-            text("Vision model for frame analysis").size(10).color(palette::TEXT_DIM),
+            text("Stitches 4 frames into 2x2 grid per API request").size(11).color(palette::TEXT_DIM),
         ]
         .align_y(Alignment::Center)
         .spacing(10);
 
         // Prompt input
         let prompt_section = column![
-            text("Skip Prompt").size(12).color(palette::TEXT_DIM),
+            text("Moderation Criteria / Skip Prompt").size(12).color(palette::TEXT_DIM),
             text_input(
-                "What should the AI skip? e.g. sponsorships, violence...",
+                "Detect explicit adult nudity, extreme violence, gore, or sponsor segments...",
                 &self.ai_skip_prompt,
             )
             .on_input(Message::AiPromptChanged)
-            .padding(10)
+            .padding(9)
             .style(|_: &Theme, _| iced::widget::text_input::Style {
                 background: Background::Color(palette::BG_ELEVATED),
                 border: Border {
-                    color: palette::BORDER_SUBTLE,
+                    color: palette::BORDER_CARD,
                     width: 1.0,
                     radius: 8.0.into(),
                 },
@@ -1712,51 +2385,102 @@ impl OtipApp {
         .spacing(6);
 
         // Scan button + status
-        let scan_row = row![
-            button(
-                row![
-                    text(if self.scan_progress.is_some() { "⏳" } else { "✨" }).size(13),
-                    text(if self.scan_progress.is_some() {
-                        "Scanning..."
-                    } else {
-                        "Start AI Scan"
+        let scan_btn = button(
+            row![
+                text(if self.scan_progress.is_some() { "⏳" } else { "✨" }).size(13),
+                text(if self.scan_progress.is_some() {
+                    "Scanning in Progress..."
+                } else {
+                    "Run Gemini Lookahead Scan"
+                })
+                .size(12)
+                .color(Color::WHITE),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+        )
+        .on_press_maybe(if self.scan_progress.is_some() {
+            None
+        } else {
+            Some(Message::StartAiScan)
+        })
+        .padding([8, 20])
+        .style(|_: &Theme, status| button::Style {
+            background: Some(Background::Color(match status {
+                button::Status::Hovered => Color::from_rgb(0.72, 0.40, 1.0),
+                _ => palette::AI_PURPLE,
+            })),
+            border: Border { radius: 10.0.into(), ..Default::default() },
+            text_color: Color::WHITE,
+            shadow: Shadow::default(),
+            snap: false,
+        });
+
+        // Summary chips of cuts found
+        let cuts_summary: Element<'_, Message> = if self.unsafe_segments.is_empty() {
+            container(text("No explicit segments detected yet").size(11).color(palette::TEXT_DIM))
+                .padding([4, 10])
+                .style(|_: &Theme| container::Style {
+                    background: Some(Background::Color(palette::BG_ELEVATED)),
+                    border: Border { radius: 6.0.into(), ..Default::default() },
+                    shadow: Shadow::default(),
+                    text_color: None,
+                    snap: false,
+                })
+                .into()
+        } else {
+            let count = self.unsafe_segments.len();
+            let mut cuts_row = vec![
+                container(
+                    row![
+                        text("🔴").size(9),
+                        text(format!("{} cuts ready", count)).size(11).color(palette::SKIP_RED),
+                    ]
+                    .spacing(4)
+                    .align_y(Alignment::Center),
+                )
+                .padding([4, 10])
+                .style(|_: &Theme| container::Style {
+                    background: Some(Background::Color(palette::SKIP_RED_DIM)),
+                    border: Border { radius: 6.0.into(), color: palette::SKIP_RED, width: 1.0 },
+                    shadow: Shadow::default(),
+                    text_color: None,
+                    snap: false,
+                })
+                .into(),
+            ];
+            for (start, end) in self.unsafe_segments.iter().take(4) {
+                cuts_row.push(
+                    container(
+                        text(format!("{}-{}", format_duration_short(*start), format_duration_short(*end)))
+                            .size(10)
+                            .color(palette::SKIP_RED),
+                    )
+                    .padding([3, 8])
+                    .style(|_: &Theme| container::Style {
+                        background: Some(Background::Color(palette::BG_ELEVATED)),
+                        border: Border { radius: 6.0.into(), ..Default::default() },
+                        shadow: Shadow::default(),
+                        text_color: None,
+                        snap: false,
                     })
-                    .size(12)
-                    .color(Color::WHITE),
-                ]
-                .spacing(6)
-                .align_y(Alignment::Center),
-            )
-            .on_press_maybe(if self.scan_progress.is_some() {
-                None
-            } else {
-                Some(Message::StartAiScan)
-            })
-            .padding([8, 18])
-            .style(|_: &Theme, status| button::Style {
-                background: Some(Background::Color(match status {
-                    button::Status::Hovered => palette::ACCENT_HOVER,
-                    _ => palette::ACCENT,
-                })),
-                border: Border { radius: 10.0.into(), ..Default::default() },
-                text_color: Color::WHITE,
-                shadow: Shadow::default(),
-                snap: false,
-            }),
+                    .into(),
+                );
+            }
+            row(cuts_row).spacing(6).align_y(Alignment::Center).into()
+        };
+
+        let scan_row = row![
+            scan_btn,
+            Space::new().width(Length::Fixed(8.0)),
             text(self.status.clone())
                 .size(11)
                 .color(if self.status_is_error { palette::ALERT } else { palette::TEXT_DIM }),
             Space::new().width(Length::Fill),
-            text(if self.unsafe_segments.is_empty() {
-                "No skip segments yet".to_string()
-            } else {
-                format!("{} skip segment(s)", self.unsafe_segments.len())
-            })
-            .size(11)
-            .color(palette::TEXT_DIM),
+            cuts_summary,
         ]
         .align_y(Alignment::Center)
-        .spacing(10);
+        .spacing(8);
 
         // Progress bar
         let progress_section = if let Some(p) = self.scan_progress {
@@ -1768,7 +2492,7 @@ impl OtipApp {
                     Space::new().width(Length::Fill),
                     text(format!("{}%", (p * 100.0).round() as u32))
                         .size(11)
-                        .color(palette::ACCENT),
+                        .color(palette::AI_PURPLE),
                 ]
                 .align_y(Alignment::Center),
                 progress_bar(0.0..=1.0, p)
@@ -1785,13 +2509,13 @@ impl OtipApp {
                 .spacing(10),
         )
         .width(Length::Fill)
-        .padding([14, 18])
+        .padding([14, 20])
         .style(|_: &Theme| container::Style {
-            background: Some(Background::Color(palette::SURFACE)),
+            background: Some(Background::Color(palette::SURFACE_DOCK)),
             border: Border {
-                color: palette::BORDER_SUBTLE,
+                color: palette::AI_PURPLE_DIM,
                 width: 1.0,
-                radius: 12.0.into(),
+                radius: 14.0.into(),
             },
             shadow: Shadow::default(),
             text_color: Some(palette::TEXT_MAIN),
@@ -1800,90 +2524,369 @@ impl OtipApp {
         .into()
     }
 
-    fn view_player(&self) -> Element<Message> {
-        // ── Video Rendering: Software fallback (Wayland stable) ──────
-        // Previously: mpv hwdec=auto + wgpu zero-copy shared texture (empty stub on Wayland/Vulkan).
-        // Now: software render fallback - Handle::from_pixels(width, height, buffer) sent via PlayerEvent::Frame
-        // UI Rendering: simply use standard iced::widget::image(handle) to display frame.
-        // This is highly stable on Wayland, no wgpu Device, no FBO, no hwdec interop.
-        // iced::widget::image(handle) is the correct fallback.
-        let video_area: Element<Message> = if let Some(handle) = &self.video_handle {
-            // Software fallback: display Handle::from_pixels / Handle::from_rgba via iced::widget::image
-            // iced::widget::image(handle) - stable SW fallback
-            iced::widget::image(handle.clone()).width(Length::Fill).height(Length::Fill).into()
+    /// Smart Timeline (The Crown Jewel of Otip Lookahead):
+    /// Multi-layer visual timeline:
+    /// - Gray: Unscanned/Unknown ahead
+    /// - Green: Scanned and safe buffer zone
+    /// - Red: Explicit content detected segments (auto-skipped)
+    /// - Overlay slider & chapter ticks
+    fn render_smart_timeline(&self) -> Element<'_, Message> {
+        let total_secs = self.duration.as_secs_f64().max(0.001);
+        let pos_secs = self.position.as_secs_f64().clamp(0.0, total_secs);
+
+        // 1. Safe Scanned Buffer calculation:
+        // In Safe Mode or when scan completed: full 100% is verified.
+        // In Instant Play: from 0 up to current position + lookahead buffer seconds.
+        let lookahead_secs = if self.playback_mode == PlaybackMode::SafeMode || (!self.unsafe_segments.is_empty() && self.scan_progress.is_none()) {
+            total_secs
         } else {
-            container(column![
-                text("▶ No video - select from library").size(18).color(Color::WHITE).align_x(Alignment::Center),
-                Space::new().height(Length::Fixed(8.0)),
-                text(self.selected_video_path.as_ref().and_then(|p| p.file_name()).and_then(|n| n.to_str()).map(|n| n.to_string()).or_else(|| self.stream_title.clone()).unwrap_or("no file".into())).size(12).color(palette::TEXT_MAIN),
-                Space::new().height(Length::Fixed(8.0)),
-                text(if self.video_player.is_some() { "Loading video (SW fallback)..." } else { "" }).size(11).color(palette::TEXT_DIM),
-            ].align_x(Alignment::Center).spacing(4))
-            .width(Length::Fill).height(Length::Fill).center_x(Length::Fill).center_y(Length::Fill)
-            .style(|_: &Theme| container::Style{ background: Some(Background::Color(palette::BG_MAIN)), border: Border{ color: palette::BG_HOVER, width:1.0, radius:8.0.into()}, shadow: Shadow::default(), text_color: None, snap:false }).into()
+            (pos_secs + self.buffered_ahead_secs.max(30.0)).min(total_secs)
+        };
+        let safe_portion = ((lookahead_secs / total_secs) * 1000.0).round().clamp(0.0, 1000.0) as u16;
+        let unscanned_portion = 1000 - safe_portion;
+
+        // Visual multi-color buffer track:
+        // Emerald Green (Scanned Safe Buffer) + Neutral Zinc (Unscanned Ahead)
+        let base_colored_track: Element<'_, Message> = row![
+            container(Space::new().width(Length::Fill).height(Length::Fixed(6.0)))
+                .width(Length::FillPortion(safe_portion.max(1)))
+                .style(|_: &Theme| container::Style {
+                    background: Some(Background::Color(palette::SAFE_GREEN)),
+                    border: Border { radius: 3.0.into(), ..Default::default() },
+                    shadow: Shadow::default(),
+                    text_color: None,
+                    snap: false,
+                }),
+            container(Space::new().width(Length::Fill).height(Length::Fixed(6.0)))
+                .width(Length::FillPortion(unscanned_portion.max(1)))
+                .style(|_: &Theme| container::Style {
+                    background: Some(Background::Color(palette::UNSCANNED_GRAY)),
+                    border: Border { radius: 3.0.into(), ..Default::default() },
+                    shadow: Shadow::default(),
+                    text_color: None,
+                    snap: false,
+                }),
+        ]
+        .spacing(0)
+        .width(Length::Fill)
+        .into();
+
+        // 2. Flagged Unsafe Segments (Auto-Skip red markers)
+        let skip_markers: Element<'_, Message> = if self.unsafe_segments.is_empty() || self.duration.is_zero() {
+            Space::new().height(Length::Fixed(0.0)).into()
+        } else {
+            let mut markers = Vec::new();
+            let mut cur = 0.0;
+            for (start, end) in &self.unsafe_segments {
+                let s = start.as_secs_f64().clamp(0.0, total_secs);
+                let e = end.as_secs_f64().clamp(s, total_secs);
+                if s > cur {
+                    let gap = s - cur;
+                    let portion = ((gap / total_secs) * 1000.0).round().max(1.0) as u16;
+                    markers.push(
+                        container(Space::new().width(Length::Fill).height(Length::Fixed(6.0)))
+                            .width(Length::FillPortion(portion))
+                            .style(|_: &Theme| container::Style {
+                                background: Some(Background::Color(Color::TRANSPARENT)),
+                                ..Default::default()
+                            })
+                            .into(),
+                    );
+                }
+                let seg_len = (e - s).max(0.1);
+                let portion = ((seg_len / total_secs) * 1000.0).round().max(4.0) as u16;
+                markers.push(
+                    mouse_area(
+                        container(Space::new().width(Length::Fill).height(Length::Fixed(6.0)))
+                            .width(Length::FillPortion(portion))
+                            .style(|_: &Theme| container::Style {
+                                background: Some(Background::Color(palette::SKIP_RED)),
+                                border: Border {
+                                    radius: 3.0.into(),
+                                    color: Color::WHITE,
+                                    width: 1.0,
+                                },
+                                shadow: Shadow::default(),
+                                text_color: None,
+                                snap: false,
+                            }),
+                    )
+                    .on_press(Message::SeekTo(*start))
+                    .into(),
+                );
+                cur = e;
+            }
+            if cur < total_secs {
+                let gap = total_secs - cur;
+                let portion = ((gap / total_secs) * 1000.0).round().max(1.0) as u16;
+                markers.push(
+                    container(Space::new().width(Length::Fill).height(Length::Fixed(6.0)))
+                        .width(Length::FillPortion(portion))
+                        .style(|_: &Theme| container::Style {
+                            background: Some(Background::Color(Color::TRANSPARENT)),
+                            ..Default::default()
+                        })
+                        .into(),
+                );
+            }
+            row(markers).spacing(0).width(Length::Fill).into()
         };
 
-        // Top-right overlay: three-dot menu holding the playback-mode choices
-        // (Safe / Instant / Auto-Skip). One compact button instead of three.
-        let dots_btn = button(text("⋯").size(15).color(Color::WHITE))
-            .on_press(Message::ToggleModeMenu)
-            .padding([2, 10])
-            .style(move |_: &Theme, _| button::Style {
-                background: Some(Background::Color(if self.mode_menu_open {
-                    palette::ACCENT
+        // 3. Chapters
+        let chapter_segments = chapter_segments(&self.chapters, self.duration);
+        let chapter_strip: Element<'_, Message> = if chapter_segments.is_empty() {
+            Space::new().height(Length::Fixed(0.0)).into()
+        } else {
+            let position = self.position;
+            let segments: Vec<Element<'_, Message>> = chapter_segments
+                .into_iter()
+                .map(|(start, end)| {
+                    let gap = (end - start).as_secs_f64().max(0.0);
+                    let portion = ((gap / total_secs) * 1000.0).round().clamp(1.0, 1000.0) as u16;
+                    let active = position >= start && position < end;
+                    mouse_area(
+                        container(Space::new().width(Length::Fill).height(Length::Fixed(4.0)))
+                            .width(Length::FillPortion(portion))
+                            .style(move |_: &Theme| container::Style {
+                                background: Some(Background::Color(if active {
+                                    palette::ACCENT
+                                } else {
+                                    palette::MARKER_IDLE
+                                })),
+                                border: Border { radius: 2.0.into(), ..Default::default() },
+                                shadow: Shadow::default(),
+                                text_color: None,
+                                snap: false,
+                            }),
+                    )
+                    .on_press(Message::SeekTo(start))
+                    .into()
+                })
+                .collect();
+            row(segments).spacing(2).width(Length::Fill).into()
+        };
+
+        // 4. Seek Slider
+        let seek_bar = slider(0.0..=1.0, self.timeline_pos as f64, Message::Seek)
+            .step(0.002)
+            .width(Length::Fill)
+            .style(dark_slider_style());
+
+        // Stack seek bar directly with the underlying colored smart timeline tracks
+        let layered_timeline = stack![
+            container(base_colored_track).width(Length::Fill).align_y(Alignment::Center),
+            container(skip_markers).width(Length::Fill).align_y(Alignment::Center),
+            container(seek_bar).width(Length::Fill).align_y(Alignment::Center),
+        ]
+        .width(Length::Fill);
+
+        // Smart Timeline Legend & Metrics Bar
+        let time_text = format!("{} / {}", format_duration_short(self.position), format_duration_short(self.duration));
+        let chapter_info = current_chapter_title(&self.chapters, self.position);
+
+        let chapter_chip: Element<'_, Message> = if let Some(ch) = chapter_info {
+            container(text(format!("·  {}", ch)).size(11).color(palette::ACCENT))
+                .padding([1, 6])
+                .style(|_: &Theme| container::Style::default())
+                .into()
+        } else {
+            Space::new().width(Length::Shrink).into()
+        };
+
+        let time_chip = row![
+            text(time_text).size(12).color(palette::TEXT_MAIN),
+            chapter_chip,
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center);
+
+        let skips_count = self.unsafe_segments.len();
+        let legend = row![
+            row![
+                container(Space::new().width(Length::Fixed(8.0)).height(Length::Fixed(8.0)))
+                    .style(|_: &Theme| container::Style {
+                        background: Some(Background::Color(palette::SAFE_GREEN)),
+                        border: Border { radius: 4.0.into(), ..Default::default() },
+                        ..Default::default()
+                    }),
+                text("Scanned Safe").size(10).color(palette::TEXT_DIM),
+            ].spacing(4).align_y(Alignment::Center),
+            row![
+                container(Space::new().width(Length::Fixed(8.0)).height(Length::Fixed(8.0)))
+                    .style(|_: &Theme| container::Style {
+                        background: Some(Background::Color(palette::SKIP_RED)),
+                        border: Border { radius: 4.0.into(), ..Default::default() },
+                        ..Default::default()
+                    }),
+                text(if skips_count > 0 {
+                    format!("Auto-Skip ({} cuts)", skips_count)
                 } else {
-                    palette::BTN_BG
-                })),
-                border: Border { radius: 6.0.into(), ..Default::default() },
-                text_color: Color::WHITE,
+                    "Explicit Skip".into()
+                })
+                .size(10)
+                .color(palette::SKIP_RED),
+            ].spacing(4).align_y(Alignment::Center),
+            row![
+                container(Space::new().width(Length::Fixed(8.0)).height(Length::Fixed(8.0)))
+                    .style(|_: &Theme| container::Style {
+                        background: Some(Background::Color(palette::UNSCANNED_GRAY)),
+                        border: Border { radius: 4.0.into(), ..Default::default() },
+                        ..Default::default()
+                    }),
+                text("Unscanned").size(10).color(palette::TEXT_DIM),
+            ].spacing(4).align_y(Alignment::Center),
+        ]
+        .spacing(12)
+        .align_y(Alignment::Center);
+
+        let buffer_label = match self.playback_mode {
+            PlaybackMode::SafeMode => "🛡 Fully Protected",
+            PlaybackMode::InstantPlay => "⚡ Lookahead: +30s Buffer",
+            PlaybackMode::AutoSkip => "🤖 Real-Time Skip Active",
+        };
+        let buffer_chip = container(text(buffer_label).size(10).color(palette::SAFE_GREEN))
+            .padding([2, 8])
+            .style(|_: &Theme| container::Style {
+                background: Some(Background::Color(palette::SAFE_GREEN_DIM)),
+                border: Border { radius: 10.0.into(), color: palette::SAFE_GREEN, width: 1.0 },
                 shadow: Shadow::default(),
+                text_color: None,
                 snap: false,
             });
-        let mode_choice = |label: &'static str,
-                           hint: &'static str,
-                           mode: PlaybackMode,
-                           current: PlaybackMode|
-         -> Element<Message> {
+
+        let timeline_header = row![
+            time_chip,
+            Space::new().width(Length::Fill),
+            legend,
+            Space::new().width(Length::Fill),
+            buffer_chip,
+        ]
+        .align_y(Alignment::Center)
+        .width(Length::Fill);
+
+        column![
+            chapter_strip,
+            layered_timeline,
+            Space::new().height(Length::Fixed(2.0)),
+            timeline_header,
+        ]
+        .spacing(4)
+        .width(Length::Fill)
+        .into()
+    }
+
+    fn view_player(&self) -> Element<'_, Message> {
+        let video_area: Element<'_, Message> = if let Some(handle) = &self.video_handle {
+            iced::widget::image(handle.clone()).width(Length::Fill).height(Length::Fill).into()
+        } else {
+            let display_name = self
+                .selected_video_path
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .map(|n| n.to_string())
+                .or_else(|| self.stream_title.clone())
+                .unwrap_or("Ready to play".into());
+
+            container(
+                column![
+                    container(text("◈").size(36).color(palette::ACCENT))
+                        .padding(14)
+                        .style(|_: &Theme| container::Style {
+                            background: Some(Background::Color(palette::ACCENT_DIM)),
+                            border: Border { radius: 36.0.into(), color: palette::ACCENT, width: 1.0 },
+                            shadow: Shadow::default(),
+                            text_color: None,
+                            snap: false,
+                        }),
+                    Space::new().height(Length::Fixed(12.0)),
+                    text(display_name).size(16).color(palette::TEXT_MAIN),
+                    Space::new().height(Length::Fixed(4.0)),
+                    text(if self.video_player.is_some() {
+                        "Initializing video engine (SW Fallback)..."
+                    } else {
+                        "Select a video from the library to begin"
+                    })
+                    .size(12)
+                    .color(palette::TEXT_DIM),
+                ]
+                .align_x(Alignment::Center)
+                .spacing(4),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill)
+            .style(|_: &Theme| container::Style {
+                background: Some(Background::Color(Color { r: 0.05, g: 0.05, b: 0.06, a: 1.0 })),
+                border: Border::default(),
+                shadow: Shadow::default(),
+                text_color: None,
+                snap: false,
+            })
+            .into()
+        };
+
+        // Top-Right Mode Badge & Menu Overlay
+        let (mode_icon, mode_txt, mode_col) = match self.playback_mode {
+            PlaybackMode::SafeMode => ("🛡", "Safe Mode", palette::SAFE_GREEN),
+            PlaybackMode::InstantPlay => ("⚡", "Instant Play", palette::WARN),
+            PlaybackMode::AutoSkip => ("🤖", "Auto-Skip", palette::ACCENT),
+        };
+
+        let mode_chip = button(
+            row![
+                text(mode_icon).size(12),
+                text(mode_txt).size(11).color(mode_col),
+                text("▾").size(10).color(palette::TEXT_DIM),
+            ]
+            .spacing(5)
+            .align_y(Alignment::Center),
+        )
+        .on_press(Message::ToggleModeMenu)
+        .padding([6, 12])
+        .style(move |_: &Theme, _| button::Style {
+            background: Some(Background::Color(if self.mode_menu_open {
+                palette::BG_HOVER
+            } else {
+                palette::SURFACE_DOCK
+            })),
+            border: Border {
+                radius: 12.0.into(),
+                color: mode_col,
+                width: 1.0,
+            },
+            text_color: Color::WHITE,
+            shadow: Shadow::default(),
+            snap: false,
+        });
+
+        let mode_choice = |label: &'static str, hint: &'static str, mode: PlaybackMode, current: PlaybackMode| -> Element<'_, Message> {
             row![
                 overlay_btn(label, mode, current == mode),
-                text(hint)
-                    .size(11)
-                    .color(palette::TEXT_DIM),
+                text(hint).size(11).color(palette::TEXT_DIM),
             ]
             .align_y(Alignment::Center)
             .spacing(8)
             .into()
         };
         let current_mode = self.playback_mode;
-        let mode_panel: Element<Message> = if self.mode_menu_open {
-            container(column![
-                mode_choice(
-                    "Safe Mode",
-                    "Look ahead, skip sensitive scenes",
-                    PlaybackMode::SafeMode,
-                    current_mode
-                ),
-                mode_choice(
-                    "Instant Play",
-                    "Start right away, no scanning",
-                    PlaybackMode::InstantPlay,
-                    current_mode
-                ),
-                mode_choice(
-                    "Auto-Skip",
-                    "Skip flagged segments automatically",
-                    PlaybackMode::AutoSkip,
-                    current_mode
-                ),
-            ]
-            .spacing(4))
-            .padding(10)
+        let mode_panel: Element<'_, Message> = if self.mode_menu_open {
+            container(
+                column![
+                    mode_choice("Safe Mode", "Look ahead & skip sensitive scenes", PlaybackMode::SafeMode, current_mode),
+                    mode_choice("Instant Play", "Start right away, live background scan", PlaybackMode::InstantPlay, current_mode),
+                    mode_choice("Auto-Skip", "Skip flagged segments on-the-fly", PlaybackMode::AutoSkip, current_mode),
+                ]
+                .spacing(6),
+            )
+            .padding(12)
             .style(|_: &Theme| container::Style {
                 background: Some(Background::Color(palette::PANEL_BG)),
                 border: Border {
                     color: palette::DIVIDER,
                     width: 1.0,
-                    radius: 8.0.into(),
+                    radius: 10.0.into(),
                 },
                 shadow: Shadow::default(),
                 text_color: Some(palette::TEXT_MAIN),
@@ -1893,153 +2896,29 @@ impl OtipApp {
         } else {
             Space::new().height(Length::Fixed(0.0)).into()
         };
-        let overlay = container(
+
+        let top_overlay = container(
             column![
                 row![
                     Space::new().width(Length::Fill),
-                    dots_btn,
+                    mode_chip,
                 ],
                 mode_panel,
             ]
             .spacing(6),
         )
-        .padding(8)
-            .style(|_: &Theme| container::Style{ background: Some(Background::Color(palette::SCRIM)), border: Border{ color: palette::DIVIDER, width:1.0, radius:8.0.into()}, shadow: Shadow::default(), text_color: None, snap:false });
+        .padding(12);
 
         let stacked_video = stack![
             container(video_area).width(Length::Fill).height(Length::Fill),
-            container(overlay).width(Length::Fill).height(Length::Fill).align_x(Alignment::End).align_y(Alignment::Start).padding(12),
-        ].width(Length::Fill).height(Length::FillPortion(1));
-
-        // ── Core UI Controls: Reorganized L/C/R layout ──
-        let playback_state = if self.is_playing { PlaybackState::Playing } else { PlaybackState::Paused };
-        let play_pause_icon = match playback_state {
-            PlaybackState::Playing => "⏸",
-            PlaybackState::Paused => "▶",
-            _ => "▶",
-        };
-        let time_text = format!("{} / {}", format_duration_short(self.position), format_duration_short(self.duration));
-        let time_label = match current_chapter_title(&self.chapters, self.position) {
-            Some(title) => format!("{}  ·  {}", time_text, title),
-            None => time_text,
-        };
-
-        // Buffering badge
-        let buffering_badge: Element<Message> = if self.is_buffering {
-            container(text("⏳ Buffering…").size(10).color(palette::ACCENT))
-                .padding([3, 8])
-                .style(|_: &Theme| container::Style {
-                    background: Some(Background::Color(palette::ACCENT_DIM)),
-                    border: Border { radius: 12.0.into(), ..Default::default() },
-                    shadow: Shadow::default(),
-                    text_color: None,
-                    snap: false,
-                })
-                .into()
-        } else {
-            Space::new().width(Length::Shrink).into()
-        };
-
-        // Buffered strip
-        let buffered_frac = if self.duration.as_secs_f64() > 0.0 {
-            ((self.position.as_secs_f64() + self.buffered_ahead_secs)
-                / self.duration.as_secs_f64())
-            .clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        let buffered_filled = (buffered_frac * 1000.0).round() as u16;
-        let buffered_strip: Element<Message> = row![
-            container(Space::new().width(Length::Fill).height(Length::Fixed(3.0)))
-                .width(Length::FillPortion(buffered_filled))
-                .style(|_: &Theme| container::Style {
-                    background: Some(Background::Color(palette::ACCENT_SOFT)),
-                    border: Border { radius: 2.0.into(), ..Default::default() },
-                    shadow: Shadow::default(), text_color: None, snap: false,
-                }),
-            container(Space::new().width(Length::Fill).height(Length::Fixed(3.0)))
-                .width(Length::FillPortion(1000 - buffered_filled))
-                .style(|_: &Theme| container::Style {
-                    background: Some(Background::Color(palette::TRACK_BG)),
-                    border: Border { radius: 2.0.into(), ..Default::default() },
-                    shadow: Shadow::default(), text_color: None, snap: false,
-                }),
+            container(top_overlay).width(Length::Fill).height(Length::Fill).align_x(Alignment::End).align_y(Alignment::Start),
         ]
-        .spacing(0)
-        .into();
+        .width(Length::Fill)
+        .height(Length::FillPortion(1));
 
-        // Chapter strip
-        let chapter_segments = chapter_segments(&self.chapters, self.duration);
-        let chapter_strip: Element<Message> = if chapter_segments.is_empty() {
-            Space::new().height(Length::Fixed(0.0)).into()
-        } else {
-            let total = self.duration.as_secs_f64().max(0.001);
-            let position = self.position;
-            let segments: Vec<Element<Message>> = chapter_segments
-                .into_iter()
-                .map(|(start, end)| {
-                    let gap = (end - start).as_secs_f64().max(0.0);
-                    let portion = ((gap / total) * 1000.0).round().clamp(1.0, 1000.0) as u16;
-                    let active = position >= start && position < end;
-                    mouse_area(
-                        container(Space::new().width(Length::Fill).height(Length::Fixed(6.0)))
-                            .width(Length::FillPortion(portion))
-                            .style(move |_: &Theme| container::Style {
-                                background: Some(Background::Color(if active {
-                                    palette::ACCENT
-                                } else {
-                                    palette::MARKER_IDLE
-                                })),
-                                border: Border { radius: 3.0.into(), ..Default::default() },
-                                shadow: Shadow::default(), text_color: None, snap: false,
-                            }),
-                    )
-                    .on_press(Message::SeekTo(start))
-                    .into()
-                })
-                .collect();
-            row(segments).spacing(2).into()
-        };
+        // Transport & Controls setup
+        let play_pause_icon = if self.is_playing { "⏸" } else { "▶" };
 
-        // Seek bar
-        let seek_bar = slider(0.0..=1.0, self.timeline_pos as f64, Message::Seek)
-            .step(0.005)
-            .width(Length::Fill)
-            .style(dark_slider_style());
-
-        // Volume
-        let mute_icon = if self.is_muted || self.volume < 0.01 { "🔇" } else if self.volume < 0.5 { "🔉" } else { "🔊" };
-        let volume_row = row![
-            ctrl_btn_icon(mute_icon, Message::ToggleMute, false),
-            slider(0.0..=1.0, self.volume as f64, Message::SetVolume)
-                .step(0.02)
-                .width(Length::Fixed(80.0))
-                .style(dark_slider_style()),
-        ]
-        .spacing(4)
-        .align_y(Alignment::Center);
-
-        // Speed
-        let speed_menu = pick_list(
-            &SPEED_OPTIONS[..],
-            Some(speed_label(self.playback_speed)),
-            |label: &'static str| Message::SetSpeed(parse_speed_label(label)),
-        )
-        .placeholder("1.0x")
-        .width(Length::Fixed(80.0))
-        .style(dark_pick_list_style());
-
-        // Toggle buttons (compact)
-        let loop_btn = ctrl_btn_icon(if self.is_looping { "🔁" } else { "🔁" }, Message::ToggleLoop, self.is_looping);
-        let cc_btn = ctrl_btn_label("CC", Message::ToggleCaptions, self.show_subs);
-        let settings_btn = ctrl_btn_icon("⚙", Message::ToggleSettings, self.settings_open);
-        let ai_btn = ctrl_btn_label("✨ AI", Message::ToggleAiPanel, self.ai_panel_open);
-        let fs_label = if self.is_fullscreen { "🗗" } else { "⛶" };
-        let fs_btn = ctrl_btn_icon(fs_label, Message::ToggleFullscreen, false);
-        let pip_label = if self.is_mini { "❏" } else { "❏" };
-        let pip_btn = ctrl_btn_icon(pip_label, Message::ToggleMini, self.is_mini);
-
-        // ── LEFT GROUP: Back button ──
         let left_group = row![
             button(
                 row![
@@ -2061,42 +2940,134 @@ impl OtipApp {
                 shadow: Shadow::default(),
                 snap: false,
             }),
-            text(time_label.clone()).size(12).color(palette::TEXT_DIM),
-            buffering_badge,
+            Space::new().width(Length::Fixed(6.0)),
+            // Volume
+            ctrl_btn_icon(
+                if self.is_muted || self.volume < 0.01 { "🔇" } else if self.volume < 0.5 { "🔉" } else { "🔊" },
+                Message::ToggleMute,
+                false,
+            ),
+            slider(0.0..=1.0, self.volume as f64, Message::SetVolume)
+                .step(0.02)
+                .width(Length::Fixed(75.0))
+                .style(dark_slider_style()),
         ]
-        .spacing(10)
+        .spacing(4)
         .align_y(Alignment::Center);
 
-        // ── CENTER GROUP: Playback transport ──
         let center_group = row![
             ctrl_btn_icon("⏮", Message::PrevVideo, false),
-            ctrl_btn_icon("⏪", Message::SkipBackward, false),
-            // Large play/pause button
             button(
-                text(play_pause_icon).size(18).color(Color::WHITE),
+                row![
+                    text("↺").size(12).color(palette::TEXT_MAIN),
+                    text("10s").size(10).color(palette::TEXT_MAIN),
+                ]
+                .spacing(2)
+                .align_y(Alignment::Center),
+            )
+            .on_press(Message::SkipBackward)
+            .padding([6, 8])
+            .style(|_: &Theme, status| button::Style {
+                background: Some(Background::Color(match status {
+                    button::Status::Hovered => palette::BG_HOVER,
+                    _ => Color::TRANSPARENT,
+                })),
+                border: Border { radius: 8.0.into(), ..Default::default() },
+                text_color: palette::TEXT_MAIN,
+                shadow: Shadow::default(),
+                snap: false,
+            }),
+            button(
+                container(text(play_pause_icon).size(20).color(Color::WHITE))
+                    .center_x(Length::Fill)
+                    .center_y(Length::Fill),
             )
             .on_press(Message::PlayPause)
-            .padding([10, 22])
+            .padding(0)
+            .width(Length::Fixed(46.0))
+            .height(Length::Fixed(46.0))
             .style(|_: &Theme, status| button::Style {
                 background: Some(Background::Color(match status {
                     button::Status::Hovered => palette::ACCENT_HOVER,
                     button::Status::Pressed => palette::ACCENT_PRESSED,
                     _ => palette::ACCENT,
                 })),
-                border: Border { radius: 24.0.into(), ..Default::default() },
+                border: Border { radius: 23.0.into(), ..Default::default() },
                 text_color: Color::WHITE,
                 shadow: Shadow::default(),
                 snap: false,
             }),
-            ctrl_btn_icon("⏩", Message::SkipForward, false),
+            button(
+                row![
+                    text("10s").size(10).color(palette::TEXT_MAIN),
+                    text("↻").size(12).color(palette::TEXT_MAIN),
+                ]
+                .spacing(2)
+                .align_y(Alignment::Center),
+            )
+            .on_press(Message::SkipForward)
+            .padding([6, 8])
+            .style(|_: &Theme, status| button::Style {
+                background: Some(Background::Color(match status {
+                    button::Status::Hovered => palette::BG_HOVER,
+                    _ => Color::TRANSPARENT,
+                })),
+                border: Border { radius: 8.0.into(), ..Default::default() },
+                text_color: palette::TEXT_MAIN,
+                shadow: Shadow::default(),
+                snap: false,
+            }),
             ctrl_btn_icon("⏭", Message::NextVideo, false),
         ]
         .spacing(6)
         .align_y(Alignment::Center);
 
-        // ── RIGHT GROUP: Utilities ──
+        let speed_menu = pick_list(
+            &SPEED_OPTIONS[..],
+            Some(speed_label(self.playback_speed)),
+            |label: &'static str| Message::SetSpeed(parse_speed_label(label)),
+        )
+        .placeholder("1.0x")
+        .width(Length::Fixed(72.0))
+        .style(dark_pick_list_style());
+
+        let cc_btn = ctrl_btn_label("CC", Message::ToggleCaptions, self.show_subs);
+        let loop_btn = ctrl_btn_icon("🔁", Message::ToggleLoop, self.is_looping);
+        let ai_btn = button(
+            row![
+                text("✨").size(12),
+                text("AI Moderator").size(11).color(palette::AI_PURPLE),
+            ]
+            .spacing(5)
+            .align_y(Alignment::Center),
+        )
+        .on_press(Message::ToggleAiPanel)
+        .padding([6, 12])
+        .style(|_: &Theme, status| button::Style {
+            background: Some(Background::Color(if self.ai_panel_open {
+                palette::AI_PURPLE_DIM
+            } else {
+                match status {
+                    button::Status::Hovered => palette::BG_HOVER,
+                    _ => Color::TRANSPARENT,
+                }
+            })),
+            border: Border {
+                radius: 12.0.into(),
+                color: if self.ai_panel_open { palette::AI_PURPLE } else { palette::BORDER_CARD },
+                width: 1.0,
+            },
+            text_color: palette::AI_PURPLE,
+            shadow: Shadow::default(),
+            snap: false,
+        });
+
+        let settings_btn = ctrl_btn_icon("⚙", Message::ToggleSettings, self.settings_open);
+        let pip_btn = ctrl_btn_icon("❏", Message::ToggleMini, self.is_mini);
+        let fs_label = if self.is_fullscreen { "🗗" } else { "⛶" };
+        let fs_btn = ctrl_btn_icon(fs_label, Message::ToggleFullscreen, false);
+
         let right_group = row![
-            volume_row,
             cc_btn,
             loop_btn,
             speed_menu,
@@ -2108,7 +3079,6 @@ impl OtipApp {
         .spacing(6)
         .align_y(Alignment::Center);
 
-        // Assembled controls: L · Fill · C · Fill · R
         let controls_row = row![
             left_group,
             Space::new().width(Length::Fill),
@@ -2119,25 +3089,22 @@ impl OtipApp {
         .align_y(Alignment::Center)
         .width(Length::Fill);
 
-        let bottom_bar: Element<Message> = container(
+        let bottom_bar: Element<'_, Message> = container(
             column![
-                buffered_strip,
-                Space::new().height(Length::Fixed(2.0)),
-                chapter_strip,
-                seek_bar,
-                Space::new().height(Length::Fixed(4.0)),
+                self.render_smart_timeline(),
+                Space::new().height(Length::Fixed(6.0)),
                 controls_row,
             ]
             .spacing(4),
         )
         .width(Length::Fill)
-        .padding([10, 16])
+        .padding([12, 18])
         .style(|_: &Theme| container::Style {
-            background: Some(Background::Color(palette::BAR_BG)),
+            background: Some(Background::Color(palette::SURFACE_DOCK)),
             border: Border {
-                color: palette::BORDER_SUBTLE,
+                color: palette::BORDER_CARD,
                 width: 1.0,
-                radius: 12.0.into(),
+                radius: 16.0.into(),
             },
             shadow: Shadow::default(),
             text_color: Some(palette::TEXT_MAIN),
@@ -2145,23 +3112,20 @@ impl OtipApp {
         })
         .into();
 
-        // 2. UX: Auto-Hide Controls - progressive disclosure, hide after 3s mouse inactivity
-        // Container with auto-hide: visible if controls_visible else transparent spacer
-        let overlay_controls: Element<Message> = if self.controls_visible {
+        let overlay_controls: Element<'_, Message> = if self.controls_visible {
             container(bottom_bar).width(Length::Fill).padding(12).into()
         } else {
             Space::new().height(Length::Fixed(0.0)).into()
         };
 
-        // Settings popup panel (gear menu): render-quality selector plus
-        // chapter count. Shown above the control bar while open.
+        // Settings Panel
         let chapter_count = self.chapters.len();
         let sub_hint = if self.sub_tracks.is_empty() {
             "No embedded subtitles in this file"
         } else {
             "Embedded tracks from file"
         };
-        let settings_panel: Element<Message> = if self.settings_open {
+        let settings_panel: Element<'_, Message> = if self.settings_open {
             container(
                 column![
                     row![
@@ -2212,13 +3176,13 @@ impl OtipApp {
                 .spacing(8),
             )
             .width(Length::Fill)
-            .padding([10, 14])
+            .padding([12, 16])
             .style(|_: &Theme| container::Style {
                 background: Some(Background::Color(palette::PANEL_BG)),
                 border: Border {
                     color: palette::DIVIDER,
                     width: 1.0,
-                    radius: 8.0.into(),
+                    radius: 10.0.into(),
                 },
                 shadow: Shadow::default(),
                 text_color: Some(palette::TEXT_MAIN),
@@ -2229,12 +3193,13 @@ impl OtipApp {
             Space::new().height(Length::Fixed(0.0)).into()
         };
 
-        // Dedicated AI panel overlay (toggled via ✨ AI button).
         let ai_panel = self.view_ai_panel();
 
-        let player_stack = column![stacked_video, settings_panel, ai_panel, overlay_controls].spacing(0).width(Length::Fill).height(Length::Fill);
+        let player_stack = column![stacked_video, settings_panel, ai_panel, overlay_controls]
+            .spacing(0)
+            .width(Length::Fill)
+            .height(Length::Fill);
 
-        // Wrap entire player in mouse_area to capture mouse movement for auto-hide
         mouse_area(player_stack).on_move(|_| Message::MouseMoved).into()
     }
 }
@@ -2487,7 +3452,7 @@ async fn scan_default_media_dirs() -> Vec<PathBuf> {
 // ── Boilerplate ─────────────────────────────────────────────────────
 fn boot() -> (OtipApp, Task<Message>) { OtipApp::new() }
 fn update(app: &mut OtipApp, msg: Message) -> Task<Message> { app.update(msg) }
-fn view(app: &OtipApp) -> Element<Message> { app.view() }
+fn view(app: &OtipApp) -> Element<'_, Message> { app.view() }
 fn theme(_: &OtipApp) -> Theme { Theme::Dark }
 fn title(app: &OtipApp) -> String { app.title() }
 fn subscription(app: &OtipApp) -> iced::Subscription<Message> {
@@ -2890,5 +3855,40 @@ mod player_controls_tests {
         assert!(app.is_buffering);
         let _ = app.update(Message::Buffering(false));
         assert!(!app.is_buffering);
+    }
+
+    #[test]
+    fn search_query_filters_videos() {
+        let (mut app, _) = OtipApp::new();
+        assert_eq!(app.search_query, "");
+        let _ = app.update(Message::SearchQueryChanged("matrix".into()));
+        assert_eq!(app.search_query, "matrix");
+    }
+
+    #[test]
+    fn preplay_dialog_flow() {
+        let (mut app, _) = OtipApp::new();
+        assert!(!app.preplay_dialog_open);
+        assert!(app.preplay_target.is_none());
+
+        let video = PathBuf::from("/tmp/video.mp4");
+        let _ = app.update(Message::OpenPreplayDialog(video.clone()));
+        assert!(app.preplay_dialog_open);
+        assert_eq!(app.preplay_target, Some(video));
+
+        let _ = app.update(Message::ClosePreplayDialog);
+        assert!(!app.preplay_dialog_open);
+        assert!(app.preplay_target.is_none());
+    }
+
+    #[test]
+    fn select_video_with_mode_applies() {
+        let (mut app, _) = OtipApp::new();
+        let video = PathBuf::from("/tmp/action_movie.mp4");
+        let _ = app.update(Message::SelectVideoWithMode(video.clone(), PlaybackMode::InstantPlay));
+        assert_eq!(app.playback_mode, PlaybackMode::InstantPlay);
+        assert_eq!(app.screen, AppScreen::Player);
+        assert_eq!(app.selected_video_path, Some(video));
+        assert!(!app.preplay_dialog_open);
     }
 }
