@@ -1190,7 +1190,7 @@ impl OtipApp {
         let center_badge: Element<'_, Message> = match self.screen {
             AppScreen::Splash => container(
                 row![
-                    text("⚡").size(11),
+                    text("»").size(11).color(palette::ACCENT),
                     text("Welcome & Setup").size(11).color(palette::TEXT_DIM),
                 ]
                 .spacing(4)
@@ -1209,7 +1209,7 @@ impl OtipApp {
                 let count_str = format!("{} videos", self.library_videos.len());
                 container(
                     row![
-                        text("📂").size(11),
+                        text("▤").size(11).color(palette::TEXT_DIM),
                         text("Media Library").size(11).color(palette::TEXT_MAIN),
                         text("•").size(9).color(palette::TEXT_DIM),
                         text(count_str).size(10).color(palette::TEXT_DIM),
@@ -1237,13 +1237,13 @@ impl OtipApp {
                     .or_else(|| self.stream_title.clone())
                     .unwrap_or_else(|| "Media Stream".into());
                 let (mode_icon, mode_txt, mode_col) = match self.playback_mode {
-                    PlaybackMode::SafeMode => ("🛡", "Safe Mode", palette::SAFE_GREEN),
-                    PlaybackMode::InstantPlay => ("⚡", "Instant Play", palette::WARN),
-                    PlaybackMode::AutoSkip => ("🤖", "Auto-Skip", palette::ACCENT),
+                    PlaybackMode::SafeMode => ("◉", "Safe Mode", palette::SAFE_GREEN),
+                    PlaybackMode::InstantPlay => ("»", "Instant Play", palette::WARN),
+                    PlaybackMode::AutoSkip => ("⬡", "Auto-Skip", palette::ACCENT),
                 };
                 container(
                     row![
-                        text("🎬").size(11),
+                        text("▸").size(11).color(palette::TEXT_DIM),
                         text(name).size(11).color(palette::TEXT_MAIN),
                         container(
                             row![
@@ -1394,7 +1394,7 @@ impl OtipApp {
 
         let header = column![
             row![
-                text("🛡").size(20),
+                text("◉").size(20).color(palette::SAFE_GREEN),
                 text("Select Content Protection Mode").size(18).color(palette::TEXT_MAIN),
             ]
             .spacing(8)
@@ -1411,7 +1411,7 @@ impl OtipApp {
         let safe_card = container(
             column![
                 row![
-                    text("🛡").size(18),
+                    text("◉").size(18).color(palette::SAFE_GREEN),
                     column![
                         text("Safe Mode (Full Pre-Scan)").size(14).color(palette::SAFE_GREEN),
                         text("Recommended for family & public viewing").size(10).color(palette::TEXT_DIM),
@@ -1426,7 +1426,7 @@ impl OtipApp {
                 text("• Entire seek bar is verified safe with clear skip cuts").size(11).color(palette::TEXT_DIM),
                 Space::new().height(Length::Fixed(10.0)),
                 button(
-                    container(text("▶ Play in Safe Mode").size(12).color(Color::WHITE))
+                    container(text("▸  Play in Safe Mode").size(12).color(Color::WHITE))
                         .center_x(Length::Fill),
                 )
                 .on_press(Message::SelectVideoWithMode(path_safe, PlaybackMode::SafeMode))
@@ -1464,7 +1464,7 @@ impl OtipApp {
         let instant_card = container(
             column![
                 row![
-                    text("⚡").size(18),
+                    text("»").size(18).color(palette::WARN),
                     column![
                         text("Instant Play (Zero Trust)").size(14).color(palette::WARN),
                         text("Fastest start with real-time lookahead").size(10).color(palette::TEXT_DIM),
@@ -1476,10 +1476,10 @@ impl OtipApp {
                 Space::new().height(Length::Fixed(6.0)),
                 text("• Playback starts immediately with zero wait").size(11).color(palette::TEXT_DIM),
                 text("• Scanning runs in background 30s ahead of playhead").size(11).color(palette::TEXT_DIM),
-                text("• ⚠️ Manual seeking past green buffer enters unscanned scenes").size(11).color(palette::WARN),
+                text("• △ Manual seeking past green buffer enters unscanned scenes").size(11).color(palette::WARN),
                 Space::new().height(Length::Fixed(10.0)),
                 button(
-                    container(text("⚡ Start Instant Play").size(12).color(Color::WHITE))
+                    container(text("»  Start Instant Play").size(12).color(Color::WHITE))
                         .center_x(Length::Fill),
                 )
                 .on_press(Message::SelectVideoWithMode(path_instant, PlaybackMode::InstantPlay))
@@ -1645,7 +1645,7 @@ impl OtipApp {
 
         let cards = row![
             feature_card(
-                "🛡",
+                "◉",
                 "Safe Mode",
                 "Full pre-scan of all scenes before play. 100% guaranteed safe for public & classroom use.",
                 "GUARANTEED SAFE",
@@ -1653,7 +1653,7 @@ impl OtipApp {
                 palette::SAFE_GREEN_DIM
             ),
             feature_card(
-                "⚡",
+                "»",
                 "Instant Play",
                 "Starts instantly. Background workers look ahead 30 seconds to buffer safe regions in real-time.",
                 "LIVE LOOKAHEAD",
@@ -1661,7 +1661,7 @@ impl OtipApp {
                 palette::WARN_DIM
             ),
             feature_card(
-                "🤖",
+                "⬡",
                 "2x2 Grid Vision",
                 "Stitches 4 video frames into 2x2 grids for ultra-fast Gemini inference and millisecond cuts.",
                 "GEMINI FLASH",
@@ -1676,7 +1676,7 @@ impl OtipApp {
         let browse_btn = button(
             container(
                 row![
-                    text("📁").size(15),
+                    text("▤").size(15).color(Color::WHITE),
                     text("Browse Video Library").size(14).color(Color::WHITE),
                     text("→").size(16).color(Color::WHITE),
                 ]
@@ -1702,7 +1702,7 @@ impl OtipApp {
         let open_file_btn = button(
             container(
                 row![
-                    text("📂").size(14),
+                    text("⊞").size(14).color(palette::TEXT_MAIN),
                     text("Open Video File").size(13).color(palette::TEXT_MAIN),
                 ]
                 .spacing(6)
@@ -1726,7 +1726,7 @@ impl OtipApp {
         let stream_url_btn = button(
             container(
                 row![
-                    text("🌐").size(14),
+                    text("◎").size(14).color(palette::TEXT_MAIN),
                     text("Stream URL").size(13).color(palette::TEXT_MAIN),
                 ]
                 .spacing(6)
@@ -1812,7 +1812,7 @@ impl OtipApp {
         });
 
         // Search Input
-        let search_input = text_input("🔍 Filter videos by title...", &self.search_query)
+        let search_input = text_input("Search videos by title...", &self.search_query)
             .on_input(Message::SearchQueryChanged)
             .padding(8)
             .width(Length::Fixed(240.0))
@@ -1831,7 +1831,7 @@ impl OtipApp {
 
         let open_file_btn = button(
             row![
-                text("📂").size(12),
+                text("⊞").size(12).color(palette::TEXT_MAIN),
                 text("Open File").size(12).color(palette::TEXT_MAIN),
             ]
             .spacing(6)
@@ -1852,7 +1852,7 @@ impl OtipApp {
 
         let url_btn = button(
             row![
-                text("🌐").size(12),
+                text("◎").size(12).color(palette::TEXT_MAIN),
                 text("Stream URL").size(12).color(palette::TEXT_MAIN),
             ]
             .spacing(6)
@@ -1873,7 +1873,7 @@ impl OtipApp {
 
         let folder_btn = button(
             row![
-                text("📁").size(12),
+                text("▤").size(12).color(Color::WHITE),
                 text("Select Folder").size(12).color(Color::WHITE),
             ]
             .spacing(6)
@@ -1920,7 +1920,7 @@ impl OtipApp {
         let url_panel: Element<'_, Message> = if self.url_dialog_open {
             container(
                 row![
-                    text("🌐").size(16),
+                    text("◎").size(16).color(palette::ACCENT),
                     text_input("https://example.com/stream.m3u8", &self.url_input)
                         .on_input(Message::UrlInputChanged)
                         .on_submit(Message::PlayUrl)
@@ -1991,7 +1991,7 @@ impl OtipApp {
         let grid: Element<'_, Message> = if filtered_videos.is_empty() {
             container(
                 column![
-                    text("🎬").size(40),
+                    text("▸").size(40).color(palette::TEXT_DIM),
                     Space::new().height(Length::Fixed(10.0)),
                     text(if self.library_videos.is_empty() {
                         "No videos in library"
@@ -2073,7 +2073,7 @@ impl OtipApp {
                             stack![
                                 container(
                                     column![
-                                        text("🎬").size(26).color(palette::ACCENT),
+                                        text("▸").size(26).color(palette::ACCENT),
                                         text(ext.clone()).size(10).color(palette::TEXT_DIM),
                                     ]
                                     .spacing(4)
@@ -2105,12 +2105,12 @@ impl OtipApp {
                     let info = column![
                         text(name).size(14).color(palette::TEXT_MAIN),
                         row![
-                            text("📁").size(11),
+                            text("▤").size(11).color(palette::TEXT_DIM),
                             text(parent_name).size(11).color(palette::TEXT_DIM),
                             text("•").size(9).color(palette::TEXT_DIM),
                             container(
                                 row![
-                                    text("🛡").size(9),
+                                    text("◉").size(9).color(palette::SAFE_GREEN),
                                     text("AI Lookahead Ready").size(9).color(palette::SAFE_GREEN),
                                 ]
                                 .spacing(3)
@@ -2135,7 +2135,7 @@ impl OtipApp {
                     let p_safe = p.clone();
                     let safe_btn = button(
                         row![
-                            text("🛡").size(11),
+                            text("◉").size(11).color(Color::WHITE),
                             text("Safe Play").size(11).color(Color::WHITE),
                         ]
                         .spacing(5)
@@ -2157,7 +2157,7 @@ impl OtipApp {
                     let p_instant = p.clone();
                     let instant_btn = button(
                         row![
-                            text("⚡").size(11),
+                            text("»").size(11).color(palette::TEXT_MAIN),
                             text("Instant").size(11).color(palette::TEXT_MAIN),
                         ]
                         .spacing(5)
@@ -2275,7 +2275,7 @@ impl OtipApp {
                 text_color: None,
                 snap: false,
             }),
-            text("✨ Gemini Vision Lookahead Moderator").size(15).color(palette::TEXT_MAIN),
+            text("◈  Gemini Vision Lookahead Moderator").size(15).color(palette::TEXT_MAIN),
             Space::new().width(Length::Fill),
             container(
                 row![
@@ -2387,7 +2387,7 @@ impl OtipApp {
         // Scan button + status
         let scan_btn = button(
             row![
-                text(if self.scan_progress.is_some() { "⏳" } else { "✨" }).size(13),
+                text(if self.scan_progress.is_some() { "◌" } else { "◈" }).size(13).color(palette::AI_PURPLE),
                 text(if self.scan_progress.is_some() {
                     "Scanning in Progress..."
                 } else {
@@ -2433,7 +2433,7 @@ impl OtipApp {
             let mut cuts_row = vec![
                 container(
                     row![
-                        text("🔴").size(9),
+                        text("●").size(9).color(palette::SKIP_RED),
                         text(format!("{} cuts ready", count)).size(11).color(palette::SKIP_RED),
                     ]
                     .spacing(4)
@@ -2740,9 +2740,9 @@ impl OtipApp {
         .align_y(Alignment::Center);
 
         let buffer_label = match self.playback_mode {
-            PlaybackMode::SafeMode => "🛡 Fully Protected",
-            PlaybackMode::InstantPlay => "⚡ Lookahead: +30s Buffer",
-            PlaybackMode::AutoSkip => "🤖 Real-Time Skip Active",
+            PlaybackMode::SafeMode => "◉ Fully Protected",
+            PlaybackMode::InstantPlay => "» Lookahead: +30s Buffer",
+            PlaybackMode::AutoSkip => "⬡ Real-Time Skip Active",
         };
         let buffer_chip = container(text(buffer_label).size(10).color(palette::SAFE_GREEN))
             .padding([2, 8])
@@ -2829,9 +2829,9 @@ impl OtipApp {
 
         // Top-Right Mode Badge & Menu Overlay
         let (mode_icon, mode_txt, mode_col) = match self.playback_mode {
-            PlaybackMode::SafeMode => ("🛡", "Safe Mode", palette::SAFE_GREEN),
-            PlaybackMode::InstantPlay => ("⚡", "Instant Play", palette::WARN),
-            PlaybackMode::AutoSkip => ("🤖", "Auto-Skip", palette::ACCENT),
+            PlaybackMode::SafeMode => ("◉", "Safe Mode", palette::SAFE_GREEN),
+            PlaybackMode::InstantPlay => ("»", "Instant Play", palette::WARN),
+            PlaybackMode::AutoSkip => ("⬡", "Auto-Skip", palette::ACCENT),
         };
 
         let mode_chip = button(
@@ -2917,7 +2917,7 @@ impl OtipApp {
         .height(Length::FillPortion(1));
 
         // Transport & Controls setup
-        let play_pause_icon = if self.is_playing { "⏸" } else { "▶" };
+        let play_pause_icon = if self.is_playing { "‖" } else { "▸" };
 
         let left_group = row![
             button(
@@ -2943,7 +2943,7 @@ impl OtipApp {
             Space::new().width(Length::Fixed(6.0)),
             // Volume
             ctrl_btn_icon(
-                if self.is_muted || self.volume < 0.01 { "🔇" } else if self.volume < 0.5 { "🔉" } else { "🔊" },
+                if self.is_muted || self.volume < 0.01 { "⨯" } else if self.volume < 0.5 { "−" } else { "+" },
                 Message::ToggleMute,
                 false,
             ),
@@ -2956,7 +2956,7 @@ impl OtipApp {
         .align_y(Alignment::Center);
 
         let center_group = row![
-            ctrl_btn_icon("⏮", Message::PrevVideo, false),
+            ctrl_btn_icon("⟨⟨", Message::PrevVideo, false),
             button(
                 row![
                     text("↺").size(12).color(palette::TEXT_MAIN),
@@ -3017,7 +3017,7 @@ impl OtipApp {
                 shadow: Shadow::default(),
                 snap: false,
             }),
-            ctrl_btn_icon("⏭", Message::NextVideo, false),
+            ctrl_btn_icon("⟩⟩", Message::NextVideo, false),
         ]
         .spacing(6)
         .align_y(Alignment::Center);
@@ -3032,10 +3032,10 @@ impl OtipApp {
         .style(dark_pick_list_style());
 
         let cc_btn = ctrl_btn_label("CC", Message::ToggleCaptions, self.show_subs);
-        let loop_btn = ctrl_btn_icon("🔁", Message::ToggleLoop, self.is_looping);
+        let loop_btn = ctrl_btn_icon("⇄", Message::ToggleLoop, self.is_looping);
         let ai_btn = button(
             row![
-                text("✨").size(12),
+                text("◈").size(12),
                 text("AI Moderator").size(11).color(palette::AI_PURPLE),
             ]
             .spacing(5)
@@ -3064,7 +3064,7 @@ impl OtipApp {
 
         let settings_btn = ctrl_btn_icon("⚙", Message::ToggleSettings, self.settings_open);
         let pip_btn = ctrl_btn_icon("❏", Message::ToggleMini, self.is_mini);
-        let fs_label = if self.is_fullscreen { "🗗" } else { "⛶" };
+        let fs_label = if self.is_fullscreen { "❐" } else { "⛶" };
         let fs_btn = ctrl_btn_icon(fs_label, Message::ToggleFullscreen, false);
 
         let right_group = row![
