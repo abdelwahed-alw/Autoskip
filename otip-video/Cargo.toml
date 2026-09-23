@@ -6,7 +6,8 @@ description = "Video engine abstraction with GStreamer backend"
 
 [dependencies]
 otip-core = { path = "../otip-core" }
-tokio = { workspace = true, features = ["full", "sync", "time", "macros"] }
+tokio = { workspace = true, features = ["full", "sync", "time", "macros", "process"] }
+serde_json = { workspace = true }
 async-trait = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }

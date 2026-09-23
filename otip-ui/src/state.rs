@@ -189,7 +189,7 @@ impl AppState {
         // Check for auto-skip
         if let Some(timeline) = &self.timeline {
             if self.preferences.auto_skip_enabled && !self.is_seeking {
-                if let Some(next_safe) = timeline.get_next_safe_position(position, self.preferences.scan_ahead_seconds * 1000 / 30) {
+                if let Some(next_safe) = timeline.get_next_safe_position(position, (self.preferences.scan_ahead_seconds as u64) * 1000 / 30) {
                     // Trigger auto-skip
                     let _ = self.command_tx.send(UiCommand::SkipSegment(
                         self.current_video.unwrap(),
@@ -309,9 +309,12 @@ pub enum Message {
     Stop,
     Seek(f32), // 0.0-1.0
     SeekTo(Duration),
+    SeekRelative(i64), // relative seconds
     VolumeChanged(f32),
+    VolumeRelative(f32),
     PlaybackRateChanged(f32),
     ToggleFullscreen,
+    DismissOverlays,
     
     // File operations
     OpenFile,

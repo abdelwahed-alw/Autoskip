@@ -260,7 +260,7 @@ impl OtipApp {
                 status_is_error: false,
                 video_handle: None,
                 window_id: None,
-                unsafe_segments: vec![(Duration::from_secs(15), Duration::from_secs(25))], // dummy: skip 15s-25s for testing
+                unsafe_segments: Vec::new(), // populated by AI scan results
                 ai_skip_prompt: String::new(), // custom AI skip prompt from user
                 gemini_api_key: String::new(), // user's Gemini API key
                 gemini_model: "gemini-3.8-flash".to_string(), // selected Gemini model

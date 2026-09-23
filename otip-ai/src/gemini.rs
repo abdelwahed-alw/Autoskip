@@ -10,23 +10,13 @@ use otip_core::domain::{GridScanRequest, GridScanResponse};
 use otip_core::error::{Result, OtipError, ScannerError};
 use base64::{Engine as _, engine::general_purpose};
 
-/// Supported Gemini models
-pub const GEMINI_37_FLASH: &str = "gemini-3.8-flash";
-pub const GEMINI_35_FLASH_LITE: &str = "gemini-3.5-flash-lite";
-/// Default and available models - primary: 3.7 Flash, plus 3.5 Flash Lite
-pub const AVAILABLE_MODELS: &[&str] = &[GEMINI_37_FLASH, GEMINI_35_FLASH_LITE];
-pub const DEFAULT_MODEL: &str = GEMINI_37_FLASH;
-
-/// Human-readable label for a model id
-pub fn model_label(model_id: &str) -> &str {
-    match model_id {
-        GEMINI_37_FLASH => "Gemini 3.8 Flash",
-        GEMINI_35_FLASH_LITE => "Gemini 3.5 Flash Lite",
-        "gemini-1.5-flash-latest" => "Gemini 1.5 Flash (legacy)",
-        "gemini-2.0-flash" => "Gemini 2.0 Flash",
-        _ => model_id,
-    }
-}
+/// Supported Gemini models — re-exported from `otip_core::config` (single source of truth)
+pub use otip_core::config::{
+    GEMINI_37_FLASH, GEMINI_35_FLASH_LITE,
+    GEMINI_AVAILABLE_MODELS as AVAILABLE_MODELS,
+    GEMINI_DEFAULT_MODEL as DEFAULT_MODEL,
+    gemini_model_label as model_label,
+};
 
 /// Configuration for Gemini API
 #[derive(Debug, Clone)]

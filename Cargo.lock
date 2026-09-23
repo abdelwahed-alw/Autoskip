@@ -4106,6 +4106,7 @@ dependencies = [
  "proptest",
  "raw-window-handle",
  "rstest",
+ "serde_json",
  "thiserror 1.0.69",
  "tokio",
  "tracing",

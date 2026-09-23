@@ -5,20 +5,130 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use async_trait::async_trait;
 use otip_core::domain::{VideoId, VideoMetadata, PlaybackState};
 use otip_core::error::{Result, OtipError, VideoError};
 use image::DynamicImage;
-use tracing::{info, warn};
+use tracing::info;
 use libmpv2::Mpv;
 
 use crate::engine::EngineConfig;
 
+/// Result of ffprobe metadata probing with safe defaults
+struct ProbeResult {
+    duration: Duration,
+    width: u32,
+    height: u32,
+    fps: f32,
+    codec: String,
+    has_audio: bool,
+}
+
+impl Default for ProbeResult {
+    fn default() -> Self {
+        Self {
+            duration: Duration::from_secs(120),
+            width: 1280,
+            height: 720,
+            fps: 30.0,
+            codec: "unknown".to_string(),
+            has_audio: true,
+        }
+    }
+}
+
+/// Probe video metadata via ffprobe. Returns safe defaults if ffprobe is
+/// unavailable or the file is unreadable. Never panics.
+async fn probe_video_metadata(path: &str) -> ProbeResult {
+    let output = match tokio::process::Command::new("ffprobe")
+        .args([
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height,r_frame_rate,codec_name",
+            "-show_entries", "format=duration,nb_streams",
+            "-of", "json",
+            path,
+        ])
+        .output()
+        .await
+    {
+        Ok(o) if o.status.success() => o,
+        _ => {
+            info!("ffprobe unavailable or failed for {}, using defaults", path);
+            return ProbeResult::default();
+        }
+    };
+
+    let json: serde_json::Value = match serde_json::from_slice(&output.stdout) {
+        Ok(v) => v,
+        Err(_) => return ProbeResult::default(),
+    };
+
+    let mut result = ProbeResult::default();
+
+    // Parse duration from format section
+    if let Some(dur_str) = json.get("format")
+        .and_then(|f| f.get("duration"))
+        .and_then(|d| d.as_str())
+    {
+        if let Ok(dur) = dur_str.parse::<f64>() {
+            if dur > 0.0 {
+                result.duration = Duration::from_secs_f64(dur);
+            }
+        }
+    }
+
+    // Parse stream info (first video stream)
+    if let Some(stream) = json.get("streams")
+        .and_then(|s| s.as_array())
+        .and_then(|a| a.first())
+    {
+        if let Some(w) = stream.get("width").and_then(|v| v.as_u64()) {
+            result.width = w as u32;
+        }
+        if let Some(h) = stream.get("height").and_then(|v| v.as_u64()) {
+            result.height = h as u32;
+        }
+        if let Some(codec) = stream.get("codec_name").and_then(|v| v.as_str()) {
+            result.codec = codec.to_string();
+        }
+        // Parse frame rate (format: "30000/1001" or "30/1")
+        if let Some(fps_str) = stream.get("r_frame_rate").and_then(|v| v.as_str()) {
+            if let Some((num, den)) = fps_str.split_once('/') {
+                if let (Ok(n), Ok(d)) = (num.parse::<f32>(), den.parse::<f32>()) {
+                    if d > 0.0 {
+                        result.fps = n / d;
+                    }
+                }
+            }
+        }
+    }
+
+    // Check for audio streams
+    if let Some(nb) = json.get("format")
+        .and_then(|f| f.get("nb_streams"))
+        .and_then(|n| n.as_str())
+        .and_then(|s| s.parse::<u32>().ok())
+    {
+        // More than 1 stream usually means audio is present
+        result.has_audio = nb > 1;
+    }
+
+    info!(
+        "Probed {}: {}×{}, {:.1}fps, {}, {:.1}s, audio={}",
+        path, result.width, result.height, result.fps, result.codec,
+        result.duration.as_secs_f64(), result.has_audio
+    );
+
+    result
+}
+
 /// MpvEngine - zero-copy hardware rendering
 /// Uses libmpv2 render_context API bound to Iced's wgpu Device
+#[allow(dead_code)]
 pub struct MpvEngine {
     config: EngineConfig,
     instances: Arc<RwLock<HashMap<VideoId, MpvInstance>>>,
@@ -52,8 +162,11 @@ impl MpvEngine {
     }
 
     #[cfg(feature = "mpv")]
+    #[allow(dead_code)]
     fn create_mpv_instance(path: &str) -> Result<Arc<libmpv2::Mpv>> {
+        #[allow(unused_imports)]
         use libmpv2::*;
+        #[allow(unused_imports)]
         use libmpv2::render::{RenderContext, RenderParam, RenderParamApiType};
 
         let mpv = Mpv::new().map_err(|e| OtipError::Video(VideoError::InitFailed(format!("mpv new failed: {:?}", e))))?;
@@ -77,7 +190,7 @@ impl MpvEngine {
     }
 
     #[cfg(feature = "mpv")]
-    fn create_shared_texture(width: u32, height: u32) -> Option<wgpu::Texture> {
+    fn create_shared_texture(_width: u32, _height: u32) -> Option<wgpu::Texture> {
         // Try to get Iced's Device - if not available, return None and use SW fallback
         // Real code: inject Device from iced::advanced::graphics::wgpu::Engine
         // Here we create a headless device for type checking (not used at runtime if Iced provides one)
@@ -97,6 +210,7 @@ impl MpvEngine {
     }
 
     #[cfg(feature = "mpv")]
+    #[allow(dead_code)]
     fn create_render_context(
         _mpv: Arc<libmpv2::Mpv>,
         _texture: Option<&wgpu::Texture>,
@@ -121,7 +235,7 @@ impl MpvEngine {
         let mpv = Mpv::new().map_err(|e| OtipError::Video(VideoError::InitFailed(format!("mpv thumb new failed: {:?}", e))))?;
         mpv.set_property("hwdec", "auto").ok();
         mpv.set_property("vo", "null").ok(); // no display for thumb
-        let c_path = std::ffi::CString::new(path).unwrap();
+        let _c_path = std::ffi::CString::new(path).unwrap();
         mpv.command("loadfile", &[path, "replace"]).map_err(|e| OtipError::Video(VideoError::InitFailed(format!("thumb loadfile: {:?}", e))))?;
         // Seek to 5s
         std::thread::sleep(Duration::from_millis(200));
@@ -144,10 +258,23 @@ impl crate::engine::VideoEngine for MpvEngine {
     async fn initialize(&mut self, video_id: VideoId, path: &str) -> Result<VideoMetadata> {
         info!("Initializing libmpv (hwdec=auto) for video {}: {}", video_id, path);
 
-        // For zero-copy, we still need w/h for texture allocation - probe via mpv after load
-        let (width, height) = (1280, 720);
-        // Try to get real duration via mpv, fallback to 120s so UI doesn't stay 0:00
-        let duration = Duration::from_secs(120);
+        // Probe real metadata via ffprobe (falls back to defaults if unavailable)
+        let probed = probe_video_metadata(path).await;
+
+        let metadata = VideoMetadata {
+            id: video_id,
+            path: path.to_string(),
+            title: Path::new(path).file_stem().and_then(|s| s.to_str()).unwrap_or("Unknown").into(),
+            duration: probed.duration,
+            width: probed.width,
+            height: probed.height,
+            fps: probed.fps,
+            codec: probed.codec,
+            has_audio: probed.has_audio,
+            created_at: chrono::Utc::now(),
+            last_played: None,
+            thumbnail: None,
+        };
 
         #[cfg(feature = "mpv")]
         {
@@ -167,64 +294,19 @@ impl crate::engine::VideoEngine for MpvEngine {
             // Load file
             mpv.command("loadfile", &[path, "replace"]).map_err(|e| OtipError::Video(VideoError::InitFailed(format!("loadfile: {:?}", e))))?;
 
-            // Create shared texture and render context for zero-copy rendering
-            // In real impl, we'd get the wgpu Device from Iced and create the texture
-            // For now, we store the mpv instance and render context will be created when Device is available
-            // Create shared texture and render context for zero-copy rendering
-            // In real impl, we'd get the wgpu Device from Iced and create the texture
             let inst = MpvInstance {
                 mpv: mpv.clone(),
-                metadata: VideoMetadata {
-                    id: video_id,
-                    path: path.to_string(),
-                    title: Path::new(path).file_stem().and_then(|s| s.to_str()).unwrap_or("Unknown").into(),
-                    duration: Duration::from_secs(120),
-                    width: 1280,
-                    height: 720,
-                    fps: 30.0,
-                    codec: "h264".into(),
-                    has_audio: true,
-                    created_at: chrono::Utc::now(),
-                    last_played: None,
-                    thumbnail: None,
-                },
+                metadata: metadata.clone(),
                 state: PlaybackState::Playing,
                 started_at: Instant::now(),
                 paused_at: None,
                 base_pos: Duration::ZERO,
             };
             self.instances.write().await.insert(video_id, inst);
-            Ok(VideoMetadata {
-                id: video_id,
-                path: path.to_string(),
-                title: Path::new(path).file_stem().and_then(|s| s.to_str()).unwrap_or("Unknown").into(),
-                duration: Duration::from_secs(120),
-                width: 1280,
-                height: 720,
-                fps: 30.0,
-                codec: "h264".into(),
-                has_audio: true,
-                created_at: chrono::Utc::now(),
-                last_played: None,
-                thumbnail: None,
-            })
+            Ok(metadata)
         }
         #[cfg(not(feature = "mpv"))]
         {
-            let metadata = VideoMetadata {
-                id: video_id,
-                path: path.to_string(),
-                title: Path::new(path).file_stem().and_then(|s| s.to_str()).unwrap_or("Unknown").into(),
-                duration: Duration::from_secs(120),
-                width: 1280,
-                height: 720,
-                fps: 30.0,
-                codec: "h264".into(),
-                has_audio: true,
-                created_at: chrono::Utc::now(),
-                last_played: None,
-                thumbnail: None,
-            };
             let inst = MpvInstance {
                 metadata: metadata.clone(),
                 state: PlaybackState::Playing,
@@ -233,20 +315,7 @@ impl crate::engine::VideoEngine for MpvEngine {
                 base_pos: Duration::ZERO,
             };
             self.instances.write().await.insert(video_id, inst);
-            Ok(VideoMetadata {
-                id: video_id,
-                path: path.to_string(),
-                title: Path::new(path).file_stem().and_then(|s| s.to_str()).unwrap_or("Unknown").into(),
-                duration: Duration::from_secs(120),
-                width: 1280,
-                height: 720,
-                fps: 30.0,
-                codec: "h264".into(),
-                has_audio: true,
-                created_at: chrono::Utc::now(),
-                last_played: None,
-                thumbnail: None,
-            })
+            Ok(metadata)
         }
     }
 

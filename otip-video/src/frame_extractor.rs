@@ -1,38 +1,47 @@
 //! Batch frame extraction for scanning
+//!
+//! This module provides frame extraction abstractions used by the scanning
+//! pipeline. The primary extraction path now uses ffmpeg via `otip-core::scan`
+//! (`extract_frames_1fps`). This module retains the trait and placeholder for
+//! future mpv render-context based extraction.
 
-use crate::engine::VideoEngine;
-use image::DynamicImage;
-use otip_core::error::Result;
-use otip_core::domain::VideoId;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
+use image::DynamicImage;
+use otip_core::domain::VideoId;
+use otip_core::error::Result;
 
-/// High-performance frame extractor using GStreamer appsink
-#[cfg(feature = "gstreamer")]
-pub struct MpvFrameExtractor {
-    engine: Arc<tokio::sync::Mutex<crate::gstreamer_backend::GStreamerEngine>>,
+/// Grid frame extractor — extracts frames in batches suitable for AI grid
+/// compositing. Current implementation delegates to the video engine.
+pub struct GridFrameExtractor {
+    engine: Arc<tokio::sync::Mutex<Box<dyn crate::engine::VideoEngine>>>,
     interval: Duration,
     resolution: (u32, u32),
+    grid_size: (u32, u32),
 }
 
-#[cfg(feature = "gstreamer")]
-impl MpvFrameExtractor {
+impl GridFrameExtractor {
     pub fn new(
-        engine: Arc<tokio::sync::Mutex<crate::gstreamer_backend::GStreamerEngine>>,
+        engine: Arc<tokio::sync::Mutex<Box<dyn crate::engine::VideoEngine>>>,
         interval: Duration,
         resolution: (u32, u32),
+        grid_size: (u32, u32),
     ) -> Self {
         Self {
             engine,
             interval,
             resolution,
+            grid_size,
         }
     }
 
-    pub async fn start_extraction(
+    /// Extract frames at the configured interval across the video duration.
+    /// Sends `(timestamp, frame)` pairs to `tx`. Stops when the duration is
+    /// reached or the receiver is dropped.
+    pub async fn extract_grids(
         &self,
-        _video_id: VideoId,
+        video_id: VideoId,
         duration: Duration,
         tx: mpsc::UnboundedSender<(Duration, DynamicImage)>,
     ) -> Result<()> {
@@ -44,25 +53,23 @@ impl MpvFrameExtractor {
                 break;
             }
 
-            let frame = Self::extract_frame_at(&engine, current, self.resolution).await?;
-            if tx.send((current, frame)).is_err() {
-                break;
+            match engine.lock().await.request_frame(video_id, current).await {
+                Ok(frame) => {
+                    if tx.send((current, frame)).is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Frame extraction failed at {:?}: {}", current, e);
+                    // Skip this frame, continue with next
+                }
             }
 
             current += self.interval;
+            // Small yield to avoid starving other tasks
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
         Ok(())
-    }
-
-    async fn extract_frame_at(
-        engine: &Arc<tokio::sync::Mutex<crate::gstreamer_backend::GStreamerEngine>>,
-        timestamp: Duration,
-        _resolution: (u32, u32),
-    ) -> Result<DynamicImage> {
-        let mut engine = engine.lock().await;
-        // This will be implemented by the GStreamer backend
-        engine.request_frame(VideoId::new(), timestamp).await
     }
 }

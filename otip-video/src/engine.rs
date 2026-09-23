@@ -3,7 +3,7 @@
 use std::time::Duration;
 use async_trait::async_trait;
 use otip_core::domain::{VideoId, VideoMetadata, PlaybackState};
-use otip_core::error::{Result, OtipError, VideoError};
+use otip_core::error::Result;
 use otip_core::events::{VideoEngineEvent, VideoEngineResponse};
 use image::DynamicImage;
 use tokio::sync::mpsc;
@@ -110,7 +110,6 @@ impl Default for EngineConfig {
 }
 
 pub mod mpv_engine {
-    use super::*;
     use crate::mpv_backend::MpvEngine;
 
     impl MpvEngine {

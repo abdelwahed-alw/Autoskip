@@ -131,8 +131,21 @@ impl OtipApp {
                 self.state.seek(position);
                 Task::none()
             }
+            Message::SeekRelative(seconds) => {
+                if seconds < 0 {
+                    let abs_sec = seconds.abs() as u64;
+                    self.state.seek(self.state.position.saturating_sub(Duration::from_secs(abs_sec)));
+                } else {
+                    self.state.seek(self.state.position + Duration::from_secs(seconds as u64));
+                }
+                Task::none()
+            }
             Message::VolumeChanged(volume) => {
                 self.state.set_volume(volume);
+                Task::none()
+            }
+            Message::VolumeRelative(delta) => {
+                self.state.set_volume((self.state.volume + delta).clamp(0.0, 1.0));
                 Task::none()
             }
             Message::PlaybackRateChanged(rate) => {
@@ -141,6 +154,14 @@ impl OtipApp {
             }
             Message::ToggleFullscreen => {
                 self.state.toggle_fullscreen();
+                Task::none()
+            }
+            Message::DismissOverlays => {
+                if self.state.is_fullscreen {
+                    self.state.toggle_fullscreen();
+                } else if self.state.show_settings {
+                    self.state.show_settings = false;
+                }
                 Task::none()
             }
             Message::ShowSettings(show) => {
@@ -331,6 +352,7 @@ impl OtipApp {
                 border: Border::default(),
                 shadow: Shadow::default(),
                 text_color: Some(theme.palette().text),
+                snap: false,
             })
             .into()
     }
@@ -346,30 +368,22 @@ impl OtipApp {
                     iced::keyboard::Key::Named(Named::Space) => Some(Message::PlayPause),
                     iced::keyboard::Key::Named(Named::ArrowLeft) => {
                         if modifiers.shift() {
-                            Some(Message::SeekTo(self.state.position.saturating_sub(Duration::from_secs(60))))
+                            Some(Message::SeekRelative(-60))
                         } else {
-                            Some(Message::SeekTo(self.state.position.saturating_sub(Duration::from_secs(10))))
+                            Some(Message::SeekRelative(-10))
                         }
                     }
                     iced::keyboard::Key::Named(Named::ArrowRight) => {
                         if modifiers.shift() {
-                            Some(Message::SeekTo(self.state.position + Duration::from_secs(60)))
+                            Some(Message::SeekRelative(60))
                         } else {
-                            Some(Message::SeekTo(self.state.position + Duration::from_secs(10)))
+                            Some(Message::SeekRelative(10))
                         }
                     }
-                    iced::keyboard::Key::Named(Named::ArrowUp) => Some(Message::VolumeChanged((self.state.volume + 0.05).min(1.0))),
-                    iced::keyboard::Key::Named(Named::ArrowDown) => Some(Message::VolumeChanged((self.state.volume - 0.05).max(0.0))),
-                    iced::keyboard::Key::Named(Named::F) => Some(Message::ToggleFullscreen),
-                    iced::keyboard::Key::Named(Named::Escape) => {
-                        if self.state.is_fullscreen {
-                            Some(Message::ToggleFullscreen)
-                        } else if self.state.show_settings {
-                            Some(Message::ShowSettings(false))
-                        } else {
-                            None
-                        }
-                    }
+                    iced::keyboard::Key::Named(Named::ArrowUp) => Some(Message::VolumeRelative(0.05)),
+                    iced::keyboard::Key::Named(Named::ArrowDown) => Some(Message::VolumeRelative(-0.05)),
+                    iced::keyboard::Key::Named(Named::Escape) => Some(Message::DismissOverlays),
+                    iced::keyboard::Key::Character(c) if c == "f" => Some(Message::ToggleFullscreen),
                     _ => None,
                 }
             }
@@ -388,27 +402,27 @@ impl OtipApp {
 
     fn welcome_screen(&self) -> Element<Message> {
         let content = column![
-            Space::new(Length::Shrink, Length::Fixed(Length::FillPortion(1))),
+            Space::new().width(Length::Shrink).height(Length::FillPortion(1)),
             column![
                 text("🎬").size(80).color(Color::from_rgb(0.2, 0.6, 0.9)),
-                Space::new(Length::Shrink, Length::Fixed(16)),
+                Space::new().width(Length::Shrink).height(Length::Fixed(16.0)),
                 text("Otip").size(48).color(Color::from_rgb(0.95, 0.95, 0.95)),
-                Space::new(Length::Shrink, Length::Fixed(8)),
+                Space::new().width(Length::Shrink).height(Length::Fixed(8.0)),
                 text("Smart Video Player with AI Content Moderation").size(18).color(Color::from_rgb(0.7, 0.7, 0.75)),
             ].align_x(Alignment::Center),
-            Space::new(Length::Shrink, Length::Fixed(48)),
+            Space::new().width(Length::Shrink).height(Length::Fixed(48.0)),
             row![
                 feature_card("🛡️", "Safe Mode", "Full scan before playback"),
                 feature_card("⚡", "Instant Play", "Background scanning"),
                 feature_card("🎯", "Auto-Skip", "Seamless content filtering"),
                 feature_card("🔧", "Hardware Accel", "GPU-accelerated decoding"),
             ].spacing(16).width(Length::Fill),
-            Space::new(Length::Shrink, Length::Fixed(48)),
+            Space::new().width(Length::Shrink).height(Length::Fixed(48.0)),
             button(
-                container(row![text("📁").size(20), Space::new(Length::Fixed(8), Length::Shrink), text("Open Video").size(18)].align_y(Alignment::Center))
+                container(row![text("📁").size(20), Space::new().width(Length::Fixed(8.0)).height(Length::Shrink), text("Open Video").size(18)].align_y(Alignment::Center))
                     .width(Length::Fixed(200.0)).center_x(Length::Fill).padding(16)
             ).on_press(Message::OpenFile).padding(0),
-            Space::new(Length::Shrink, Length::Fixed(Length::FillPortion(1))),
+            Space::new().width(Length::Shrink).height(Length::FillPortion(1)),
         ].align_x(Alignment::Center).width(Length::Fill).height(Length::Fill);
         container(content).width(Length::Fill).height(Length::Fill).center_x(Length::Fill).center_y(Length::Fill).into()
     }
@@ -485,9 +499,9 @@ impl OtipApp {
 }
 
 fn feature_card<'a>(icon: &'a str, title: &'a str, desc: &'a str) -> Element<'a, Message> {
-    container(column![text(icon).size(32), Space::new(Length::Shrink, Length::Fixed(8)), text(title).size(16).color(Color::from_rgb(0.95, 0.95, 0.95)), Space::new(Length::Shrink, Length::Fixed(4)), text(desc).size(13).color(Color::from_rgb(0.6, 0.6, 0.65))].align_x(Alignment::Center))
+    container(column![text(icon).size(32), Space::new().width(Length::Shrink).height(Length::Fixed(8.0)), text(title).size(16).color(Color::from_rgb(0.95, 0.95, 0.95)), Space::new().width(Length::Shrink).height(Length::Fixed(4.0)), text(desc).size(13).color(Color::from_rgb(0.6, 0.6, 0.65))].align_x(Alignment::Center))
         .width(Length::FillPortion(1)).padding(20)
-        .style(|theme: &Theme| container::Style { background: Some(Background::Color(theme.palette().background)), border: Border::default(), shadow: Shadow::default(), text_color: Some(theme.palette().text) }).into()
+        .style(|theme: &Theme| container::Style { background: Some(Background::Color(theme.palette().background)), border: Border::default(), shadow: Shadow::default(), text_color: Some(theme.palette().text), snap: false }).into()
 }
 
 /// Boot function for iced::application

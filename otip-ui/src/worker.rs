@@ -99,7 +99,7 @@ impl WorkerHandle {
             }
             UiCommand::UpdatePreferences(prefs) => {
                 // Update moderator config
-                if let Some(moderator) = &self.content_moderator {
+                if let Some(_moderator) = &self.content_moderator {
                     // Would update config here
                     let _ = prefs;
                 }
@@ -136,6 +136,11 @@ impl WorkerHandle {
                     // Start playback immediately
                     engine.lock().await.play(video_id).await?;
                     // Start scan in background
+                    self.start_scan(video_id).await?;
+                }
+                PlaybackMode::AutoSkip => {
+                    // Same as InstantPlay for now, but UI will enable auto-skip behavior
+                    engine.lock().await.play(video_id).await?;
                     self.start_scan(video_id).await?;
                 }
             }

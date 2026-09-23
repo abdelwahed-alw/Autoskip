@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use directories::ProjectDirs;
-use crate::domain::{UserPreferences, Theme, PlaybackMode};
+use crate::domain::UserPreferences;
 
 /// Application configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -6,11 +6,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, info, warn, error};
-use image::{DynamicImage, ImageBuffer, Rgb};
+use image::{DynamicImage, ImageBuffer};
 use base64::Engine;
 use crate::domain::{
     VideoId, ScanSegment, QuadrantFlags, TimelineSegment, TimelineSegmentType,
-    GridScanRequest, GridScanResponse, ScanProgress
+    GridScanRequest, ScanProgress
 };
 use crate::error::{Result, OtipError, ScannerError};
 use crate::config::AppConfig;
@@ -256,15 +256,15 @@ impl VideoScanner {
     pub async fn scan_video(
         &self,
         video_id: VideoId,
-        video_path: String,
+        _video_path: String,
         total_duration: Duration,
         frame_receiver: mpsc::UnboundedReceiver<(Duration, DynamicImage)>,
     ) -> Result<()> {
         info!("Starting scan for video {}", video_id);
         
-        let mut scanned_duration = Duration::ZERO;
+        let mut scanned_duration;
         let mut segments_found = 0;
-        let mut explicit_segments = 0;
+        let explicit_segments = 0;
         let mut frame_buffer = Vec::new();
         let mut grid_index = 0u32;
         let frames_per_grid = (self.config.grid_size.0 * self.config.grid_size.1) as usize;
@@ -483,7 +483,7 @@ impl VideoScanner {
         // Parse response
         let explicit_quadrants = self.parse_gemini_response(&json)?;
         
-        let grid_duration = Duration::from_secs(self.config.grid_size.0 as u64 * self.config.grid_size.1 as u64);
+        let _grid_duration = Duration::from_secs(self.config.grid_size.0 as u64 * self.config.grid_size.1 as u64);
         
         for &quadrant in &explicit_quadrants {
             let segment_start = request.start_time + Duration::from_secs((quadrant - 1) as u64);

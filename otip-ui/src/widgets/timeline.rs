@@ -18,10 +18,10 @@ impl TimelineWidget {
     pub fn clear_cache(&mut self) {}
     pub fn view<'a>(
         &'a self,
-        timeline: Option<&'a Timeline>,
+        _timeline: Option<&'a Timeline>,
         position: Duration,
         duration: Duration,
-        hover_position: Option<Duration>,
+        _hover_position: Option<Duration>,
         _is_dragging: bool,
     ) -> Element<'a, TimelineMessage> {
         let progress = if duration.as_secs_f32() > 0.0 { (position.as_secs_f32() / duration.as_secs_f32()).clamp(0.0, 1.0) } else { 0.0 };
