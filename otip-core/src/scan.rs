@@ -50,6 +50,12 @@ pub const AI_SCAN_MAX_RETRIES: u32 = 3;
 pub const AI_SCAN_RETRY_BASE_DELAY_SECS: u64 = 10;
 /// Videos longer than this get sparser extraction (1fps would drown the API).
 pub const AI_SCAN_LONG_VIDEO_SECS: u64 = 300; // 5 minutes
+/// Fail-fast: abort the sequential batch loop after this many consecutive
+/// batch errors (e.g. persistent 503 overload). Prevents a 114-batch scan
+/// from stalling for 2h when the API is down from batch 1.
+pub const AI_SCAN_MAX_CONSECUTIVE_ERRORS: usize = 3;
+/// Max chars of a Gemini error body kept in logs / UI labels.
+pub const GEMINI_ERROR_BODY_PREVIEW: usize = 500;
 /// One streaming progress update: fraction 0.0..=1.0 plus a status label
 /// (e.g. `(0.45, "Analyzing batch 1/4...")`).
 pub type AiScanProgressUpdate = (f32, String);
@@ -122,6 +128,83 @@ fn retry_backoff_secs(attempt: u32) -> u64 {
     AI_SCAN_RETRY_BASE_DELAY_SECS.saturating_mul(
         2u64.saturating_pow(attempt.saturating_sub(1)),
     )
+}
+
+/// Gemini 3 family (`gemini-3*`) rejects legacy `temperature` / `top_p` /
+/// `top_k` params (Gemini 3.8 Flash docs: use `thinking_level`, default
+/// MEDIUM). Sending `temperature` yields a 400 validation error.
+pub fn is_gemini3_model(model: &str) -> bool {
+    model
+        .trim_start_matches("models/")
+        .trim()
+        .starts_with("gemini-3")
+}
+
+/// Build a `generationConfig` that won't trigger 400-validation errors:
+/// legacy models keep `temperature`, Gemini 3 models omit it.
+pub fn generation_config_json(model: &str) -> serde_json::Value {
+    if is_gemini3_model(model) {
+        serde_json::json!({
+            "maxOutputTokens": 512,
+            "responseMimeType": "application/json"
+        })
+    } else {
+        serde_json::json!({
+            "temperature": 0.1,
+            "maxOutputTokens": 512,
+            "responseMimeType": "application/json"
+        })
+    }
+}
+
+/// Truncate a Gemini error body for logs / UI (single line, capped).
+pub fn truncate_error_body(body: &str) -> String {
+    let flat: String = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.len() > GEMINI_ERROR_BODY_PREVIEW {
+        format!("{}…", &flat[..GEMINI_ERROR_BODY_PREVIEW])
+    } else {
+        flat
+    }
+}
+
+/// Lightweight credential / model check BEFORE expensive ffmpeg extraction.
+/// Sends a tiny text-only `generateContent` so a bad key, unknown model, or
+/// overloaded backend fails fast instead of after 117s of frame extraction
+/// and then 114 × 70s of batch retries.
+async fn preflight_gemini_access(
+    client: &reqwest::Client,
+    url: &str,
+    model: &str,
+) -> std::result::Result<(), String> {
+    let payload = serde_json::json!({
+        "contents": [{ "parts": [{ "text": "ping — reply with []" }] }],
+        "generationConfig": generation_config_json(model),
+    });
+    let response = client
+        .post(url)
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| format!("network error: {e}"))?;
+    let status = response.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let body = response.text().await.unwrap_or_default();
+    let preview = truncate_error_body(&body);
+    if is_retryable_status(status.as_u16()) {
+        Err(format!("Gemini overloaded ({status}). Try again later. {preview}"))
+    } else if status.as_u16() == 400
+        || status.as_u16() == 401
+        || status.as_u16() == 403
+        || status.as_u16() == 404
+    {
+        Err(format!(
+            "Gemini rejected key/model ({status}). Check API key (AIza…) and model '{model}'. {preview}"
+        ))
+    } else {
+        Err(format!("Gemini preflight failed ({status}). {preview}"))
+    }
 }
 
 /// Count `frame_*.jpg` outputs in `dir` (extraction progress polling).
@@ -442,7 +525,21 @@ impl VideoScanner {
         );
 
         let base64_image = base64::engine::general_purpose::STANDARD.encode(&request.frame_data);
-        
+
+        // Gemini 3 models reject `temperature` — build config per model.
+        let generation_config = if is_gemini3_model(&self.config.model) {
+            serde_json::json!({
+                "maxOutputTokens": 100,
+                "responseMimeType": "application/json"
+            })
+        } else {
+            serde_json::json!({
+                "temperature": 0.1,
+                "maxOutputTokens": 100,
+                "responseMimeType": "application/json"
+            })
+        };
+
         let payload = serde_json::json!({
             "contents": [{
                 "parts": [
@@ -457,11 +554,7 @@ impl VideoScanner {
                     }
                 ]
             }],
-            "generationConfig": {
-                "temperature": 0.1,
-                "maxOutputTokens": 100,
-                "responseMimeType": "application/json"
-            }
+            "generationConfig": generation_config
         });
 
         let response = self.client
@@ -1037,7 +1130,11 @@ async fn extract_frames_1fps(
 ///
 /// Rate-limit aware: 429/503 responses are retried with exponential backoff
 /// (10s, 20s, 40s, up to [`AI_SCAN_MAX_RETRIES`]) before giving up on the
-/// batch. Any other failure yields an empty vec immediately.
+/// batch. Any other failure yields `None` immediately.
+///
+/// Returns `Some(segments)` on HTTP success (possibly empty when nothing
+/// matches) and `None` on transport / API failure so the caller can
+/// distinguish "clean batch" from "failed batch" for fail-fast abort.
 ///
 /// Never panics / never returns Err to the scan loop: failures only skip
 /// their batch so sequential processing continues with the next one.
@@ -1045,6 +1142,7 @@ async fn extract_frames_1fps(
 async fn send_grid_batch(
     client: &reqwest::Client,
     url: &str,
+    model: &str,
     file_name: &str,
     effective_prompt: &str,
     batch_idx: usize,
@@ -1052,7 +1150,7 @@ async fn send_grid_batch(
     batch: &[(Duration, DynamicImage)],
     grid_jpeg: Vec<u8>,
     progress_tx: &Option<tokio::sync::mpsc::UnboundedSender<AiScanProgressUpdate>>,
-) -> Vec<(Duration, Duration)> {
+) -> Option<Vec<(Duration, Duration)>> {
     use base64::Engine as _;
     let base64_image = base64::engine::general_purpose::STANDARD.encode(&grid_jpeg);
     let stamps: Vec<u64> = batch.iter().map(|(t, _)| t.as_secs()).collect();
@@ -1078,11 +1176,7 @@ async fn send_grid_batch(
                 { "inline_data": { "mime_type": "image/jpeg", "data": base64_image } }
             ]
         }],
-        "generationConfig": {
-            "temperature": 0.1,
-            "maxOutputTokens": 512,
-            "responseMimeType": "application/json"
-        }
+        "generationConfig": generation_config_json(model)
     });
     // Retry loop for rate limiting: re-POST while Gemini says 429/503.
     let mut attempt: u32 = 0;
@@ -1091,31 +1185,36 @@ async fn send_grid_batch(
             Ok(r) => r,
             Err(e) => {
                 warn!("send_grid_batch {}/{}: request failed: {e}", batch_idx + 1, batch_count);
-                return Vec::new();
+                return None;
             }
         };
         let status = response.status();
         if is_retryable_status(status.as_u16()) {
+            // Capture body for diagnosis — 503s often carry "overloaded" detail.
+            let body = response.text().await.unwrap_or_default();
+            let preview = truncate_error_body(&body);
             if attempt >= AI_SCAN_MAX_RETRIES {
                 warn!(
-                    "send_grid_batch {}/{}: {} persisted after {} retries, skipping batch",
+                    "send_grid_batch {}/{}: {} persisted after {} retries, skipping batch. {}",
                     batch_idx + 1,
                     batch_count,
                     status,
                     AI_SCAN_MAX_RETRIES,
+                    preview,
                 );
-                return Vec::new();
+                return None;
             }
             attempt += 1;
             let backoff = retry_backoff_secs(attempt);
             warn!(
-                "send_grid_batch {}/{}: {} — retry {}/{} after {}s",
+                "send_grid_batch {}/{}: {} — retry {}/{} after {}s. {}",
                 batch_idx + 1,
                 batch_count,
                 status,
                 attempt,
                 AI_SCAN_MAX_RETRIES,
                 backoff,
+                preview,
             );
             emit_progress(
                 progress_tx,
@@ -1130,14 +1229,16 @@ async fn send_grid_batch(
             continue;
         }
         if !status.is_success() {
-            warn!("send_grid_batch {}/{}: Gemini status {}", batch_idx + 1, batch_count, status);
-            return Vec::new();
+            let body = response.text().await.unwrap_or_default();
+            let preview = truncate_error_body(&body);
+            warn!("send_grid_batch {}/{}: Gemini status {} — {}", batch_idx + 1, batch_count, status, preview);
+            return None;
         }
         let json: serde_json::Value = match response.json().await {
             Ok(j) => j,
             Err(e) => {
                 warn!("send_grid_batch {}/{}: response JSON failed: {e}", batch_idx + 1, batch_count);
-                return Vec::new();
+                return None;
             }
         };
         break json
@@ -1153,9 +1254,9 @@ async fn send_grid_batch(
     };
     if text.trim().is_empty() {
         debug!("send_grid_batch {}/{}: empty model reply", batch_idx + 1, batch_count);
-        return Vec::new();
+        return Some(Vec::new());
     }
-    parse_ai_timestamps(&text)
+    Some(parse_ai_timestamps(&text))
 }
 
 /// Text-only fallback probe (no frames): asks Gemini for skip ranges from the
@@ -1164,6 +1265,7 @@ async fn send_grid_batch(
 async fn run_text_probe(
     client: &reqwest::Client,
     url: &str,
+    model: &str,
     file_name: &str,
     effective_prompt: &str,
 ) -> Vec<(Duration, Duration)> {
@@ -1178,11 +1280,7 @@ async fn run_text_probe(
     );
     let payload = serde_json::json!({
         "contents": [{ "parts": [{ "text": instruction }] }],
-        "generationConfig": {
-            "temperature": 0.1,
-            "maxOutputTokens": 512,
-            "responseMimeType": "application/json"
-        }
+        "generationConfig": generation_config_json(model)
     });
     let response = match client.post(url).json(&payload).send().await {
         Ok(r) => r,
@@ -1192,7 +1290,13 @@ async fn run_text_probe(
         }
     };
     if !response.status().is_success() {
-        warn!("run_ai_scan text probe: Gemini status {}", response.status());
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        warn!(
+            "run_ai_scan text probe: Gemini status {} — {}",
+            status,
+            truncate_error_body(&body)
+        );
         return Vec::new();
     }
     let json: serde_json::Value = match response.json().await {
@@ -1314,6 +1418,19 @@ pub async fn run_ai_scan(
         }
     };
 
+    // 0. Preflight: validate key/model BEFORE 117s of ffmpeg extraction.
+    // A bad key, unknown model, or overloaded backend fails fast here with a
+    // clear message instead of stalling at `batch 1/114 (503)` later.
+    if !api_key.starts_with("AIza") {
+        warn!("run_ai_scan: API key does not start with 'AIza' — verify it came from aistudio.google.com/app/apikey");
+    }
+    emit_progress(&progress_tx, 0.0, "Validating Gemini API key/model...");
+    if let Err(detail) = preflight_gemini_access(&client, &url, &scanner_config.model).await {
+        warn!("run_ai_scan: preflight failed: {detail}");
+        emit_progress(&progress_tx, 1.0, format!("AI scan failed: {detail}"));
+        return Vec::new();
+    }
+
     // 1. Extraction at an adaptive rate. `temp_dir` is kept alive for the
     // whole scan — it is deleted only after ALL grid/AI work finishes below.
     // Probe duration first: it scales extraction progress AND picks the frame
@@ -1334,7 +1451,7 @@ pub async fn run_ai_scan(
     if frames.is_empty() {
         debug!("run_ai_scan: no frames extracted, falling back to text probe");
         emit_progress(&progress_tx, 0.4, "Contacting AI...");
-        let segs = run_text_probe(&client, &url, &file_name, &effective_prompt).await;
+        let segs = run_text_probe(&client, &url, &scanner_config.model, &file_name, &effective_prompt).await;
         // Safe cleanup: temp dir goes away only after the fallback probe is done.
         let _ = std::fs::remove_dir_all(&temp_dir);
         emit_progress(&progress_tx, 1.0, "AI scan complete");
@@ -1390,16 +1507,21 @@ pub async fn run_ai_scan(
 
     // 3. Sequential processing: send the batch grids one-by-one, in order —
     // each batch emits progress so the bar moves through long batch runs.
+    // Fail-fast: abort after N consecutive batch errors (persistent 503).
     let mut all_segments: Vec<(Duration, Duration)> = Vec::new();
+    let mut consecutive_errors: usize = 0;
+    // Clone model string once — `scanner` owns `scanner_config`.
+    let model_for_batches = scanner.config.model.clone();
     for (idx, (batch, grid_jpeg)) in grids.iter().enumerate() {
         emit_progress(
             &progress_tx,
             batch_progress(idx, grid_count),
             format!("Sending batch {}/{} to AI...", idx + 1, grid_count),
         );
-        let segs = send_grid_batch(
+        match send_grid_batch(
             &client,
             &url,
+            &model_for_batches,
             &file_name,
             &effective_prompt,
             idx,
@@ -1408,11 +1530,36 @@ pub async fn run_ai_scan(
             grid_jpeg.clone(),
             &progress_tx,
         )
-        .await;
-        all_segments.extend(segs);
+        .await
+        {
+            Some(segs) => {
+                consecutive_errors = 0;
+                all_segments.extend(segs);
+            }
+            None => {
+                consecutive_errors += 1;
+                if consecutive_errors >= AI_SCAN_MAX_CONSECUTIVE_ERRORS {
+                    warn!(
+                        "run_ai_scan: aborting after {consecutive_errors} consecutive batch errors at batch {}/{} (backend overloaded?)",
+                        idx + 1,
+                        grid_count
+                    );
+                    emit_progress(
+                        &progress_tx,
+                        batch_progress(idx, grid_count),
+                        format!(
+                            "Gemini overloaded — aborted at batch {}/{} after {consecutive_errors} errors. Try again later or switch model.",
+                            idx + 1,
+                            grid_count
+                        ),
+                    );
+                    break;
+                }
+            }
+        }
         // Rate limiting: 4s pacing at the end of each iteration so hundreds
         // of back-to-back batches don't trip Google's free-tier quotas.
-        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(AI_SCAN_BATCH_DELAY_SECS)).await;
     }
 
     // 4. Merge results from all batches into the final segment list.
@@ -1667,5 +1814,44 @@ mod tests {
         assert_eq!(AI_SCAN_BATCH_DELAY_SECS, 4);
         assert_eq!(AI_SCAN_RETRY_BASE_DELAY_SECS, 10);
         assert_eq!(AI_SCAN_LONG_VIDEO_SECS, 300);
+    }
+
+    #[test]
+    fn test_is_gemini3_model() {
+        assert!(is_gemini3_model("gemini-3.8-flash"));
+        assert!(is_gemini3_model("gemini-3.5-flash-lite"));
+        assert!(is_gemini3_model("models/gemini-3.8-flash"));
+        assert!(!is_gemini3_model("gemini-2.0-flash"));
+        assert!(!is_gemini3_model("gemini-1.5-flash-latest"));
+        assert!(!is_gemini3_model("gemini-2.5-flash"));
+    }
+
+    #[test]
+    fn test_generation_config_omits_temperature_for_gemini3() {
+        let g3 = generation_config_json("gemini-3.8-flash");
+        assert!(g3.get("temperature").is_none(), "Gemini 3 must not send temperature");
+        assert_eq!(g3.get("maxOutputTokens").and_then(|v| v.as_u64()), Some(512));
+
+        let legacy = generation_config_json("gemini-2.0-flash");
+        assert_eq!(
+            legacy.get("temperature").and_then(|v| v.as_f64()),
+            Some(0.1),
+            "legacy models keep temperature"
+        );
+    }
+
+    #[test]
+    fn test_truncate_error_body() {
+        assert_eq!(truncate_error_body("  503   overloaded\nretry ").as_str(), "503 overloaded retry");
+        let long = "x".repeat(GEMINI_ERROR_BODY_PREVIEW + 50);
+        let cut = truncate_error_body(&long);
+        assert!(cut.len() <= GEMINI_ERROR_BODY_PREVIEW + 3);
+        assert!(cut.ends_with('…'));
+    }
+
+    #[test]
+    fn test_failfast_constant_sane() {
+        // Abort early (3) instead of grinding 114 batches × 70s on persistent 503.
+        assert_eq!(AI_SCAN_MAX_CONSECUTIVE_ERRORS, 3);
     }
 }

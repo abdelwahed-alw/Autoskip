@@ -72,7 +72,8 @@ struct GeminiInlineData {
 
 #[derive(Debug, Serialize)]
 struct GeminiGenerationConfig {
-    temperature: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
     #[serde(rename = "maxOutputTokens")]
     max_output_tokens: u32,
     #[serde(rename = "responseMimeType")]
@@ -148,6 +149,8 @@ impl GeminiClient {
 
         let prompt = "Analyze this 2x2 grid of video frames (4 seconds total). Each quadrant represents 1 second: top-left=1st second, top-right=2nd second, bottom-left=3rd second, bottom-right=4th second. Identify which quadrants contain explicit NSFW content (nudity, sexual acts, graphic violence). Return ONLY a JSON array of quadrant numbers (1-4) that are explicit. Example: [1, 3] means top-left and bottom-left are explicit. If none are explicit, return [].";
 
+        // Gemini 3 family rejects `temperature` (use thinking_level default).
+        let use_temperature = !otip_core::scan::is_gemini3_model(&self.config.model);
         let gemini_request = GeminiRequest {
             contents: vec![GeminiContent {
                 parts: vec![
@@ -161,7 +164,7 @@ impl GeminiClient {
                 ],
             }],
             generation_config: GeminiGenerationConfig {
-                temperature: self.config.temperature,
+                temperature: if use_temperature { Some(self.config.temperature) } else { None },
                 max_output_tokens: self.config.max_output_tokens,
                 response_mime_type: "application/json".to_string(),
             },
@@ -201,23 +204,42 @@ impl GeminiClient {
                             confidence_scores,
                             processed_at: chrono::Utc::now(),
                         });
-                    } else if status == 429 {
-                        // Rate limited
-                        let retry_after = resp.headers()
+                    } else if status == 429 || status.as_u16() == 503 {
+                        // Rate limited / overloaded — back off with body context.
+                        // NOTE: headers must be read before `text()` consumes `resp`.
+                        let retry_after_header = resp
+                            .headers()
                             .get("retry-after")
                             .and_then(|v| v.to_str().ok())
-                            .and_then(|v| v.parse::<u64>().ok())
-                            .unwrap_or(60);
-                        
+                            .and_then(|v| v.parse::<u64>().ok());
+                        let body_preview = resp
+                            .text()
+                            .await
+                            .unwrap_or_default()
+                            .split_whitespace()
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        let body_preview = body_preview.chars().take(300).collect::<String>();
+                        let retry_after = if status == 429 {
+                            // Honor Retry-After when present, cap runaway waits.
+                            retry_after_header.unwrap_or(10).min(30)
+                        } else {
+                            // 503 overload: exponential within this client's loop.
+                            2_u64.pow(attempt.min(4))
+                                .saturating_mul(5)
+                                .min(40)
+                        };
+
                         let mut stats = self.stats.write().await;
                         stats.rate_limited += 1;
-                        
-                        warn!("Rate limited, waiting {}s (attempt {}/{})", retry_after, attempt + 1, self.config.max_retries + 1);
+
+                        warn!("Gemini {status} overloaded/rate-limited, waiting {retry_after}s (attempt {}/{}) {body_preview}", attempt + 1, self.config.max_retries + 1);
                         tokio::time::sleep(Duration::from_secs(retry_after)).await;
                         continue;
                     } else {
                         let error_text = resp.text().await.unwrap_or_default();
-                        last_error = Some(format!("Status {}: {}", status, error_text));
+                        let preview: String = error_text.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(500).collect();
+                        last_error = Some(format!("Status {status}: {preview}"));
                         
                         if attempt < self.config.max_retries {
                             tokio::time::sleep(Duration::from_secs(2_u64.pow(attempt))).await;
@@ -333,5 +355,32 @@ mod tests {
         let result = client.parse_response(&response).unwrap();
         let expected: Vec<u8> = vec![];
         assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_generation_config_omits_temperature_for_gemini3() {
+        // Gemini 3 must not serialize `temperature` (400 error otherwise).
+        let g3 = GeminiGenerationConfig {
+            temperature: None,
+            max_output_tokens: 512,
+            response_mime_type: "application/json".to_string(),
+        };
+        let v = serde_json::to_value(&g3).unwrap();
+        assert!(v.get("temperature").is_none());
+
+        let legacy = GeminiGenerationConfig {
+            temperature: Some(0.1),
+            max_output_tokens: 100,
+            response_mime_type: "application/json".to_string(),
+        };
+        let v = serde_json::to_value(&legacy).unwrap();
+        let t = v.get("temperature").and_then(|x| x.as_f64()).unwrap();
+        assert!((t - 0.1).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_is_gemini3_helper_matches_core() {
+        assert!(otip_core::scan::is_gemini3_model("gemini-3.8-flash"));
+        assert!(!otip_core::scan::is_gemini3_model("gemini-2.0-flash"));
     }
 }
