@@ -101,7 +101,7 @@ Config is stored at `~/.config/otip/otip/config.toml` (Linux) or the platform-eq
 | `gemini_api_key` | (none) | Google Gemini API key |
 | `gemini_model` | `gemini-3.8-flash` | AI model for scanning |
 | `scan_frame_interval` | `1` | Seconds between extracted frames |
-| `grid_size` | `(2, 2)` | Frames per grid (2×2 = 4 per API call) |
+| `grid_size` | `(2, 2)` | Frames per grid for the moderator path; the streaming Lookahead scan auto-tiles 3×3 (9 per API call) |
 | `frame_resolution` | `(320, 240)` | Frame extraction resolution |
 
 The API key can also be set via the `GEMINI_API_KEY` environment variable.

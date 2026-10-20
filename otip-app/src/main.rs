@@ -1662,8 +1662,8 @@ impl OtipApp {
             ),
             feature_card(
                 "⬡",
-                "2x2 Grid Vision",
-                "Stitches 4 video frames into 2x2 grids for ultra-fast Gemini inference and millisecond cuts.",
+                "3x3 Grid Vision",
+                "Stitches 9 video frames into 3x3 grids for ultra-fast Gemini inference and millisecond cuts.",
                 "GEMINI FLASH",
                 palette::AI_PURPLE,
                 palette::AI_PURPLE_DIM
@@ -2355,7 +2355,7 @@ impl OtipApp {
             .placeholder("gemini-3.8-flash")
             .width(Length::Fixed(220.0))
             .style(dark_pick_list_style()),
-            text("Stitches 4 frames into 2x2 grid per API request").size(11).color(palette::TEXT_DIM),
+            text("Stitches 9 frames into 3x3 grid per API request — fewer calls, higher free-tier headroom").size(11).color(palette::TEXT_DIM),
         ]
         .align_y(Alignment::Center)
         .spacing(10);

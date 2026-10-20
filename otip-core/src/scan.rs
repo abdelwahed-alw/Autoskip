@@ -27,9 +27,11 @@ pub const GEMINI_TIMEOUT_SECS: u64 = 60;
 /// Frame extraction rate for `run_ai_scan`: 1 frame per second.
 pub const AI_SCAN_FRAME_INTERVAL: Duration = Duration::from_secs(1);
 /// Frames per Gemini grid in `run_ai_scan`: small API-friendly batches.
-/// 4 frames = one 2x2 grid; keeps each request tiny so long videos never
-/// build a single massive payload (the old 503 cause).
-pub const AI_SCAN_FRAMES_PER_BATCH: usize = 4;
+/// 9 frames = one 3x3 grid; keeps each request tiny so long videos never
+/// build a single massive payload (the old 503 cause) while cutting the
+/// number of API calls ~2.2x versus the old 2x2 layout (114 → 51 batches
+/// for a 22-minute video) — critical under free-tier daily quotas.
+pub const AI_SCAN_FRAMES_PER_BATCH: usize = 9;
 /// Hard cap: no batch may ever exceed this many frames. Batches are rendered
 /// as one grid image each, so this bounds every single API payload.
 pub const AI_SCAN_MAX_FRAMES_PER_BATCH: usize = 20;
@@ -42,7 +44,7 @@ pub const AI_SCAN_EXTRACTION_END: f32 = 0.30;
 pub const AI_SCAN_COMBINING_END: f32 = 0.40;
 pub const AI_SCAN_ANALYSIS_END: f32 = 0.90;
 /// Pacing between sequential Gemini batch calls (free-tier rate protection).
-/// 1361 frames → 341 batches back-to-back is exactly what earns 429s.
+/// 454 frames → 51 batches back-to-back is exactly what earns 429s.
 pub const AI_SCAN_BATCH_DELAY_SECS: u64 = 4;
 /// Retries per batch when Gemini answers 429/503 before skipping the batch.
 pub const AI_SCAN_MAX_RETRIES: u32 = 3;
@@ -123,6 +125,119 @@ fn is_retryable_status(code: u16) -> bool {
     code == 429 || code == 503
 }
 
+/// Grid tiling for a batch of `frames` frames: `cols = ⌈√n⌉`, `rows = ⌈n/cols⌉`.
+/// Returns `(columns, rows)` matching `ScannerConfig::grid_size` semantics
+/// (`grid_size.0` is used as the column divisor in `create_grid_image`).
+/// Square batches (4→2x2, 9→3x3, 16→4x4) stay perfectly square; partial
+/// batches (the often-smaller last chunk) simply tile tighter.
+pub fn grid_layout_for_batch_size(frames: usize) -> (u32, u32) {
+    match frames {
+        0 => (1, 1),
+        n => {
+            let cols = (n as f64).sqrt().ceil() as usize;
+            let rows = n.div_ceil(cols.max(1));
+            (cols.max(1) as u32, rows.max(1) as u32)
+        }
+    }
+}
+
+fn is_daily_quota_exhausted(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    let resource_exhausted =
+        lower.contains("resource_exhausted") || lower.contains("resource exhausted");
+    if !resource_exhausted {
+        return false;
+    }
+    // Discriminate the *daily* (plan) quota from transient per-minute RPM
+    // spikes. The window is the safest signal: Gemini's daily exhaustion says
+    // "retry in 19h50m…" while RPM limits say "retry in 30s". Day-keyworded
+    // metric names are the explicit fallback when the window is unparseable.
+    if scan_retry_window_minutes(body) >= 60 {
+        return true;
+    }
+    lower.contains("per_day") || lower.contains("requests_per_day") || lower.contains("daily_limit")
+}
+
+/// Parse "Please retry in 19h50m18.24s" / "retryDelay": "86400s" suffixes and
+/// return the retry window in minutes (0 when unparseable).
+/// Case-insensitive: lowercases the body itself, so callers pass raw text.
+fn scan_retry_window_minutes(body: &str) -> u64 {
+    let lowered = body.to_ascii_lowercase();
+    let Some(after_marker) = lowered
+        .find("retry in")
+        .and_then(|i| lowered.get(i..))
+        .or_else(|| lowered.find("retrydelay").and_then(|i| lowered.get(i..)))
+        .or_else(|| lowered.find("resetdelay").and_then(|i| lowered.get(i..)))
+    else {
+        return 0;
+    };
+    let Some(start) = after_marker
+        .char_indices()
+        .find(|(_, c)| c.is_ascii_digit())
+        .map(|(i, _)| i)
+    else {
+        return 0;
+    };
+    let token = tail_from(&after_marker[start..]);
+
+    // Token like "19h50m18.2468s" (or "86400s"): digits+units, abort at first
+    // character outside [0-9wdhms.] to avoid eating the next JSON field.
+    // Digits after a '.' are a decimal *fraction* of the previous unit —
+    // they are discarded, not scaled.
+    let mut minutes: u64 = 0;
+    let mut value: u64 = 0;
+    let mut has_value = false;
+    let mut in_fraction = false;
+    for ch in token.chars() {
+        match ch {
+            c if c.is_ascii_digit() => {
+                if !in_fraction {
+                    value = value.saturating_mul(10).saturating_add(c as u64 - '0' as u64);
+                    has_value = true;
+                }
+            }
+            '.' => {
+                // Fractional part: suppressed digits belong to the last unit.
+                in_fraction = true;
+                has_value = false;
+                value = 0;
+            }
+            'w' | 'd' | 'h' | 'm' | 's' => {
+                if has_value {
+                    let factor: u64 = match ch {
+                        'w' => 7 * 24 * 60,
+                        'd' => 24 * 60,
+                        'h' => 60,
+                        'm' => 1,
+                        // Whole seconds rounded down into minutes
+                        // ("86400s" → 1440), fractions contribute nothing.
+                        's' => {
+                            minutes = minutes.saturating_add(value / 60);
+                            break;
+                        }
+                        _ => unreachable!(),
+                    };
+                    minutes = minutes.saturating_add(value * factor);
+                    value = 0;
+                    has_value = false;
+                }
+            }
+            _ => break,
+        }
+    }
+    minutes
+}
+
+/// Cut a whitespace/quote-free retry token ("19h50m18s", "86400s").
+fn tail_from(s: &str) -> &str {
+    let end = s
+        .char_indices()
+        .find(|(_, c)| *c != '.' && !c.is_alphanumeric())
+        .map(|(i, _)| i)
+        .unwrap_or(s.len());
+    &s[..end]
+}
+
 /// Exponential backoff before retry `attempt` (1-based): 10s, 20s, 40s…
 fn retry_backoff_secs(attempt: u32) -> u64 {
     AI_SCAN_RETRY_BASE_DELAY_SECS.saturating_mul(
@@ -170,7 +285,7 @@ pub fn truncate_error_body(body: &str) -> String {
 /// Lightweight credential / model check BEFORE expensive ffmpeg extraction.
 /// Sends a tiny text-only `generateContent` so a bad key, unknown model, or
 /// overloaded backend fails fast instead of after 117s of frame extraction
-/// and then 114 × 70s of batch retries.
+/// and then 51 × 70s of batch retries.
 async fn preflight_gemini_access(
     client: &reqwest::Client,
     url: &str,
@@ -940,7 +1055,7 @@ fn normalize_segments(mut segs: Vec<(Duration, Duration)>) -> Vec<(Duration, Dur
 /// `batch_size` is clamped to [`AI_SCAN_MAX_FRAMES_PER_BATCH`] so no batch
 /// can ever grow into a 503-sized payload. E.g. 10 frames at batch size 4 →
 /// `[4, 4, 2]`. The last batch may be smaller and still forms a valid
-/// (partial) grid.
+/// (tighter-tiled) grid: see [`grid_layout_for_batch_size`].
 pub fn chunk_frames_into_batches(
     frames: &[(Duration, DynamicImage)],
     batch_size: usize,
@@ -1126,15 +1241,27 @@ async fn extract_frames_1fps(
     (out, temp_dir)
 }
 
+/// Result of one [`send_grid_batch`] attempt.
+#[derive(Debug)]
+enum BatchOutcome {
+    /// HTTP success (possibly zero segments when the batch is clean).
+    Segments(Vec<(Duration, Duration)>),
+    /// Transport / API / parse failure — caller counts consecutive errors.
+    Failed,
+    /// 429 with a *daily* free-tier quota body — waiting 3×40s cannot help;
+    /// the whole sequential scan must stop right away. Partial segments
+    /// collected so far are still merged by the caller.
+    DailyQuotaExhausted,
+}
+
 /// Send ONE small grid batch to Gemini and parse its skip segments.
 ///
 /// Rate-limit aware: 429/503 responses are retried with exponential backoff
 /// (10s, 20s, 40s, up to [`AI_SCAN_MAX_RETRIES`]) before giving up on the
-/// batch. Any other failure yields `None` immediately.
-///
-/// Returns `Some(segments)` on HTTP success (possibly empty when nothing
-/// matches) and `None` on transport / API failure so the caller can
-/// distinguish "clean batch" from "failed batch" for fail-fast abort.
+/// batch. A 429 whose body signals a *daily* quota exhaustion
+/// ([`is_daily_quota_exhausted`]) aborts the entire scan via
+/// [`BatchOutcome::DailyQuotaExhausted`] without burning retries. Any other
+/// failure yields [`BatchOutcome::Failed`] immediately.
 ///
 /// Never panics / never returns Err to the scan loop: failures only skip
 /// their batch so sequential processing continues with the next one.
@@ -1150,15 +1277,18 @@ async fn send_grid_batch(
     batch: &[(Duration, DynamicImage)],
     grid_jpeg: Vec<u8>,
     progress_tx: &Option<tokio::sync::mpsc::UnboundedSender<AiScanProgressUpdate>>,
-) -> Option<Vec<(Duration, Duration)>> {
+) -> BatchOutcome {
     use base64::Engine as _;
     let base64_image = base64::engine::general_purpose::STANDARD.encode(&grid_jpeg);
     let stamps: Vec<u64> = batch.iter().map(|(t, _)| t.as_secs()).collect();
     let batch_start = batch.first().map(|(t, _)| t.as_secs()).unwrap_or(0);
+    let (grid_cols, _grid_rows) = grid_layout_for_batch_size(batch.len());
     let instruction = format!(
         "Video file under analysis: \"{file_name}\" (batch {}/{}, frames at seconds {:?}, sampled through the video).\n\
          User skip request: {effective_prompt}\n\
-         Analyse these {} frame(s) in time order. \
+         The {} frame(s) are stitched into ONE grid image tiled {} per row, \
+         rows top-to-bottom, cells filled left-to-right in the listed seconds order.\n\
+         Interpret the grid as a chronological strip. \
          Return ONLY a JSON array of objects with numeric \"start\" and \"end\" \
          fields in ABSOLUTE video seconds, e.g. [{{\"start\": {batch_start}, \"end\": {}}}] \
          covering the parts matching the skip request. \
@@ -1167,6 +1297,7 @@ async fn send_grid_batch(
         batch_count,
         stamps,
         batch.len(),
+        grid_cols,
         batch_start + 1,
     );
     let payload = serde_json::json!({
@@ -1185,7 +1316,7 @@ async fn send_grid_batch(
             Ok(r) => r,
             Err(e) => {
                 warn!("send_grid_batch {}/{}: request failed: {e}", batch_idx + 1, batch_count);
-                return None;
+                return BatchOutcome::Failed;
             }
         };
         let status = response.status();
@@ -1193,6 +1324,17 @@ async fn send_grid_batch(
             // Capture body for diagnosis — 503s often carry "overloaded" detail.
             let body = response.text().await.unwrap_or_default();
             let preview = truncate_error_body(&body);
+            // Daily free-tier quota: no wait inside this scan can recover it.
+            // Abort immediately so the caller merges what it already has.
+            if status.as_u16() == 429 && is_daily_quota_exhausted(&body) {
+                warn!(
+                    "send_grid_batch {}/{}: daily free-tier quota exhausted — aborting scan without retries. {}",
+                    batch_idx + 1,
+                    batch_count,
+                    preview,
+                );
+                return BatchOutcome::DailyQuotaExhausted;
+            }
             if attempt >= AI_SCAN_MAX_RETRIES {
                 warn!(
                     "send_grid_batch {}/{}: {} persisted after {} retries, skipping batch. {}",
@@ -1202,7 +1344,7 @@ async fn send_grid_batch(
                     AI_SCAN_MAX_RETRIES,
                     preview,
                 );
-                return None;
+                return BatchOutcome::Failed;
             }
             attempt += 1;
             let backoff = retry_backoff_secs(attempt);
@@ -1232,13 +1374,13 @@ async fn send_grid_batch(
             let body = response.text().await.unwrap_or_default();
             let preview = truncate_error_body(&body);
             warn!("send_grid_batch {}/{}: Gemini status {} — {}", batch_idx + 1, batch_count, status, preview);
-            return None;
+            return BatchOutcome::Failed;
         }
         let json: serde_json::Value = match response.json().await {
             Ok(j) => j,
             Err(e) => {
                 warn!("send_grid_batch {}/{}: response JSON failed: {e}", batch_idx + 1, batch_count);
-                return None;
+                return BatchOutcome::Failed;
             }
         };
         break json
@@ -1254,9 +1396,9 @@ async fn send_grid_batch(
     };
     if text.trim().is_empty() {
         debug!("send_grid_batch {}/{}: empty model reply", batch_idx + 1, batch_count);
-        return Some(Vec::new());
+        return BatchOutcome::Segments(Vec::new());
     }
-    Some(parse_ai_timestamps(&text))
+    BatchOutcome::Segments(parse_ai_timestamps(&text))
 }
 
 /// Text-only fallback probe (no frames): asks Gemini for skip ranges from the
@@ -1459,7 +1601,7 @@ pub async fn run_ai_scan(
         return segs;
     }
 
-    // 2. Combining: small fixed groups (default 4 frames per grid image,
+    // 2. Combining: small fixed groups (default 9 frames per 3x3 grid image,
     // hard-capped at AI_SCAN_MAX_FRAMES_PER_BATCH). NEVER one massive grid.
     emit_progress(&progress_tx, AI_SCAN_EXTRACTION_END, "Combining images into batches...");
     let batches = chunk_frames_into_batches(&frames, AI_SCAN_FRAMES_PER_BATCH);
@@ -1475,6 +1617,10 @@ pub async fn run_ai_scan(
     // NOTE: `scan_progress_tx` is the VideoScanner channel — distinct from the
     // `progress_tx` streaming-AI-scan sender above (no shadowing).
     scanner_config.frame_interval = Duration::from_secs(frame_step_secs);
+    // Derive the grid tiling from the chunk size (9 frames → 3x3) so every
+    // frame of a batch is rendered into the grid — a stale `(2,2)` from a
+    // saved config.toml would silently drop the extra 5 frames.
+    scanner_config.grid_size = grid_layout_for_batch_size(AI_SCAN_FRAMES_PER_BATCH);
     let (scan_progress_tx, _) = mpsc::unbounded_channel();
     let (segment_tx, _) = mpsc::unbounded_channel();
     let scanner = VideoScanner::new(scanner_config, scan_progress_tx, segment_tx);
@@ -1532,11 +1678,29 @@ pub async fn run_ai_scan(
         )
         .await
         {
-            Some(segs) => {
+            BatchOutcome::Segments(segs) => {
                 consecutive_errors = 0;
                 all_segments.extend(segs);
             }
-            None => {
+            BatchOutcome::DailyQuotaExhausted => {
+                warn!(
+                    "run_ai_scan: daily Gemini free-tier quota exhausted — stopping scan at batch {}/{}; merging {} segment(s) found so far",
+                    idx + 1,
+                    grid_count,
+                    all_segments.len()
+                );
+                emit_progress(
+                    &progress_tx,
+                    batch_progress(idx, grid_count),
+                    format!(
+                        "Gemini daily free-tier quota reached at batch {}/{} — scan stopped early. Switch model (e.g. Flash Lite) or rescan tomorrow.",
+                        idx + 1,
+                        grid_count
+                    ),
+                );
+                break;
+            }
+            BatchOutcome::Failed => {
                 consecutive_errors += 1;
                 if consecutive_errors >= AI_SCAN_MAX_CONSECUTIVE_ERRORS {
                     warn!(
@@ -1657,19 +1821,77 @@ mod tests {
     }
 
     #[test]
-    fn test_chunk_frames_into_batches_of_four() {
-        // 10 frames at 1fps → batches [4, 4, 2]: small API-friendly grids.
-        let frames = dummy_frames(10);
+    fn test_chunk_frames_into_batches_of_nine() {
+        // 19 frames → batches [9, 9, 1]: 3x3 API-friendly grids plus a
+        // tighter-tiled final grid for the partial remainder.
+        let frames = dummy_frames(19);
         let batches = chunk_frames_into_batches(&frames, AI_SCAN_FRAMES_PER_BATCH);
         assert_eq!(batches.len(), 3);
-        assert_eq!(batches[0].len(), 4);
-        assert_eq!(batches[1].len(), 4);
-        assert_eq!(batches[2].len(), 2);
+        assert_eq!(batches[0].len(), 9);
+        assert_eq!(batches[1].len(), 9);
+        assert_eq!(batches[2].len(), 1);
         // Timestamps preserved for absolute segment mapping.
         assert_eq!(batches[0][0].0, Duration::from_secs(0));
-        assert_eq!(batches[1][0].0, Duration::from_secs(4));
-        assert_eq!(batches[2][0].0, Duration::from_secs(8));
+        assert_eq!(batches[1][0].0, Duration::from_secs(9));
+        assert_eq!(batches[2][0].0, Duration::from_secs(18));
         assert_eq!(AI_SCAN_FRAME_INTERVAL, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn test_grid_layout_for_batch_size() {
+        // Default streaming layout: 9 frames → square 3x3.
+        assert_eq!(grid_layout_for_batch_size(9), (3, 3));
+        // Legacy moderation layout: 4 frames → square 2x2.
+        assert_eq!(grid_layout_for_batch_size(4), (2, 2));
+        // Partial last batches tile tighter without wasting cells.
+        assert_eq!(grid_layout_for_batch_size(1), (1, 1));
+        assert_eq!(grid_layout_for_batch_size(5), (3, 2));
+        // Degenerate inputs never panic.
+        assert_eq!(grid_layout_for_batch_size(0), (1, 1));
+        assert_eq!(
+            (grid_layout_for_batch_size(9).0 as u32)
+                * (grid_layout_for_batch_size(9).1 as u32),
+            9
+        );
+    }
+
+    #[test]
+    fn test_is_daily_quota_exhausted() {
+        // Real-world daily-quota body (from otip logs, 22-min video scan):
+        let daily = r#"{"error": {"code": 429, "message": "You exceeded your current quota, please check your plan and billing details. ... Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_requests, limit: 20, model: gemini-3.8-flash. Please retry in 19h50m18.24680596s.", "status": "RESOURCE_EXHAUSTED"}}"#;
+        assert!(is_daily_quota_exhausted(daily));
+        assert!(is_daily_quota_exhausted(
+            r#"{"error": {"status": "RESOURCE_EXHAUSTED", "details": [{"reason": "RATE_LIMIT_EXCEEDED", "quotaResetDelay": "86400s"}]}}"#
+        ));
+        // Per-minute RPM limit resets fast — must NOT abort the scan.
+        assert!(!is_daily_quota_exhausted(
+            r#"{"error": {"code": 429, "message": "Quota exceeded for metric: generate_content_free_tier_requests, limit: 15 per minute. Please retry in 30s.", "status": "RESOURCE_EXHAUSTED"}}"#
+        ));
+        assert!(!is_daily_quota_exhausted(r#"{"error": {"code": 429, "message": "Rate limited, retry in 59m59s", "status": "RESOURCE_EXHAUSTED"}}"#));
+        // Fatal quota status never triggers on other error classes.
+        assert!(!is_daily_quota_exhausted(
+            r#"{"error": {"code": 503, "message": "The model is overloaded. Please try again later.", "status": "UNAVAILABLE"}}"#
+        ));
+        assert!(!is_daily_quota_exhausted(
+            r#"{"error": {"code": 400, "message": "API key not valid.", "status": "INVALID_ARGUMENT"}}"#
+        ));
+    }
+
+    #[test]
+    fn test_scan_retry_window_minutes() {
+        // "19h50m18.24680596s" from the real 429 (truncated fraction).
+        assert_eq!(
+            scan_retry_window_minutes("please retry in 19h50m18.24680596s."),
+            19 * 60 + 50
+        );
+        // Pure-seconds JSON delay fields.
+        assert_eq!(scan_retry_window_minutes(r#""retryDelay":"86400s""#), 24 * 60);
+        // Sub-minute and sub-hour windows never read as daily.
+        assert_eq!(scan_retry_window_minutes("retry in 30s"), 0);
+        assert_eq!(scan_retry_window_minutes("retry in 0h45s"), 0);
+        // No window at all → 0, never a false "daily".
+        assert_eq!(scan_retry_window_minutes("overloaded backend"), 0);
+        assert_eq!(scan_retry_window_minutes("resource_exhausted"), 0);
     }
 
     #[test]
