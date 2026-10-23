@@ -86,6 +86,7 @@ pub mod palette {
 pub enum AppScreen {
     Splash,
     Library,
+    SafeScan,
     Player,
 }
 
@@ -129,6 +130,8 @@ pub enum Message {
     GeminiApiKeyChanged(String), // Gemini API key text field edits
     GeminiModelSelected(String), // Gemini model selection
     StartAiScan, // "Start AI Scan" button -> Gemini frame analysis -> auto-skip regions
+    StartSafeScan, // Safe Mode gate: run the AI scan before playback, auto-play when finished
+    CloseSafeScan, // Cancel Safe Mode gate -> back to Library (no playback)
     AiScanProgress(f32, String), // streaming progress fraction 0.0..=1.0 + status label
     AiScanComplete(Vec<(Duration, Duration)>), // parsed skip timestamps from run_ai_scan
     ChaptersLoaded(Vec<ChapterInfo>), // embedded chapters from mpv chapter-list
@@ -214,6 +217,15 @@ pub struct OtipApp {
 
 impl OtipApp {
     fn new() -> (Self, Task<Message>) {
+        // Restore persisted AI settings (key/model) so Safe Scan can start
+        // directly instead of forcing the key to be retyped every session.
+        let saved = otip_core::config::AppConfig::load().unwrap_or_default();
+        let saved_key = saved.gemini_api_key.clone().unwrap_or_default();
+        let saved_model = if saved.gemini_model.is_empty() {
+            otip_core::config::GEMINI_DEFAULT_MODEL.to_string()
+        } else {
+            saved.gemini_model.clone()
+        };
         (
             Self {
                 screen: AppScreen::Splash,
@@ -262,8 +274,8 @@ impl OtipApp {
                 window_id: None,
                 unsafe_segments: Vec::new(), // populated by AI scan results
                 ai_skip_prompt: String::new(), // custom AI skip prompt from user
-                gemini_api_key: String::new(), // user's Gemini API key
-                gemini_model: "gemini-3.8-flash".to_string(), // selected Gemini model
+                gemini_api_key: saved_key, // restored from persisted config
+                gemini_model: saved_model, // restored from persisted config
             },
             Task::none(),
         )
@@ -280,6 +292,15 @@ impl OtipApp {
                 .or_else(|| self.stream_title.clone())
                 .map(|n| format!("Otip — {} [{}]", n, self.playback_mode))
                 .unwrap_or_else(|| "Otip — Player".into()),
+            AppScreen::SafeScan => {
+                let name = self
+                    .selected_video_path
+                    .as_ref()
+                    .and_then(|p| p.file_name())
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("Media");
+                format!("Otip — Safe Mode Scan: {}", name)
+            }
             AppScreen::Library => "Otip — Library".into(),
             AppScreen::Splash => "Otip — AI Content Moderator".into(),
         }
@@ -293,6 +314,17 @@ impl OtipApp {
         player.set_rate(self.playback_speed);
         player.set_sub_visibility(self.show_subs);
         player.set_quality(self.render_quality);
+    }
+
+    /// Persist the current Gemini key/model into the shared AppConfig so the
+    /// next launch restores them for the Safe Mode gate.
+    fn save_ai_config(&self) {
+        let mut config = otip_core::config::AppConfig::load().unwrap_or_default();
+        config.gemini_api_key = Some(self.gemini_api_key.clone());
+        config.gemini_model = self.gemini_model.clone();
+        if let Err(e) = config.save() {
+            tracing::warn!("Failed to persist AI config: {}", e);
+        }
     }
 
     /// Reset per-source transient state (position, chapters, subs, cache).
@@ -375,6 +407,27 @@ impl OtipApp {
                 self.playback_mode = mode;
                 self.preplay_dialog_open = false;
                 self.preplay_target = None;
+                // Safe Mode gate: show the AI status/settings screen first and
+                // only open the Player once the scan completes (AiScanComplete).
+                if mode == PlaybackMode::SafeMode {
+                    self.selected_video_path = Some(path);
+                    self.stream_title = None;
+                    self.url_dialog_open = false;
+                    self.screen = AppScreen::SafeScan;
+                    self.settings_open = false;
+                    self.ai_panel_open = false;
+                    self.mode_menu_open = false;
+                    self.controls_visible = true;
+                    self.is_playing = false;
+                    self.stop_current_player();
+                    self.reset_source_state();
+                    // Fresh scan target: drop results from any previous video
+                    // so no stale skip regions leak into playback.
+                    self.unsafe_segments.clear();
+                    self.scan_progress = None;
+                    self.scan_status.clear();
+                    return self.update(Message::StartSafeScan);
+                }
                 self.update(Message::VideoSelected(path))
             }
             Message::LibraryScanned(videos) => {
@@ -740,6 +793,64 @@ impl OtipApp {
                 );
                 Self::ai_scan_task(video_path, gemini_api_key, gemini_model, ai_skip_prompt)
             }
+            Message::StartSafeScan => {
+                // Only meaningful while waiting on the Safe Scan screen.
+                if self.screen != AppScreen::SafeScan {
+                    return Task::none();
+                }
+                if self.scan_progress.is_some() {
+                    // Already scanning — ignore double presses.
+                    return Task::none();
+                }
+                // Safe Mode verifies local files only; a network stream has
+                // nothing on disk to frame-extract yet.
+                let video_path = match self.selected_video_path.clone() {
+                    Some(p) => p,
+                    None => {
+                        self.status = "No video selected for Safe Mode scan".into();
+                        self.status_is_error = true;
+                        return Task::none();
+                    }
+                };
+                if self.gemini_api_key.trim().is_empty() {
+                    self.status = "Enter your Gemini API key to run the Safe Mode scan".into();
+                    self.status_is_error = true;
+                    return Task::none();
+                }
+                if !video_path.is_file() {
+                    self.status = "Safe Mode needs a local video file".into();
+                    self.status_is_error = true;
+                    return Task::none();
+                }
+                // Make sure gate playback starts silent and frozen until the
+                // scan hands off.
+                self.is_playing = false;
+                self.status = "Safe Mode: AI analyzing before playback...".into();
+                self.status_is_error = false;
+                self.scan_progress = Some(0.0);
+                self.scan_status = "Starting AI scan...".into();
+                self.last_mouse_move = Instant::now();
+                // Persist the AI settings used for this scan so the next run
+                // skips key entry entirely.
+                self.save_ai_config();
+                let gemini_api_key = self.gemini_api_key.clone();
+                let gemini_model = self.gemini_model.clone();
+                let ai_skip_prompt = self.ai_skip_prompt.clone();
+                tracing::info!(
+                    "StartSafeScan: {} with model {} (prompt {} chars)",
+                    video_path.display(),
+                    gemini_model,
+                    ai_skip_prompt.len()
+                );
+                Self::ai_scan_task(video_path, gemini_api_key, gemini_model, ai_skip_prompt)
+            }
+            Message::CloseSafeScan => {
+                // User abandoned the scan: no playback, straight to Library.
+                self.scan_progress = None;
+                self.scan_status.clear();
+                self.screen = AppScreen::Library;
+                Task::none()
+            }
             Message::AiScanProgress(p, label) => {
                 self.scan_progress = Some(p.clamp(0.0, 1.0));
                 self.scan_status = label;
@@ -757,6 +868,24 @@ impl OtipApp {
                 self.last_mouse_move = Instant::now();
                 self.controls_visible = true;
                 tracing::info!("AiScanComplete: {} skip segments -> auto-skip regions", count);
+                // Safe Mode gate hand-off: the scan just finished, so only now
+                // open the Player and actually start the movie.
+                if self.screen == AppScreen::SafeScan {
+                    self.screen = AppScreen::Player;
+                    self.is_playing = true;
+                    self.last_mouse_move = Instant::now();
+                    if let Some(path) = self.selected_video_path.clone() {
+                        self.status = format!(
+                            "AI Scan Complete: {} skip segment(s) — playing in Safe Mode",
+                            count
+                        );
+                        self.stop_current_player();
+                        self.reset_source_state();
+                        let player = VideoPlayerHandle::spawn(path.clone());
+                        self.apply_state_to_player(&player);
+                        self.video_player = Some(player);
+                    }
+                }
                 Task::none()
             }
             Message::ChaptersLoaded(chapters) => {
@@ -1227,6 +1356,33 @@ impl OtipApp {
                 })
                 .into()
             }
+            AppScreen::SafeScan => {
+                let name = self
+                    .selected_video_path
+                    .as_ref()
+                    .and_then(|p| p.file_name())
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("Media");
+                container(
+                    row![
+                        text("◉").size(11).color(palette::SAFE_GREEN),
+                        text("Safe Scan").size(11).color(palette::TEXT_MAIN),
+                        text("•").size(9).color(palette::TEXT_DIM),
+                        text(name).size(10).color(palette::TEXT_DIM),
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center),
+                )
+                .padding([3, 10])
+                .style(|_: &Theme| container::Style {
+                    background: Some(Background::Color(palette::SURFACE)),
+                    border: Border { radius: 12.0.into(), color: palette::BORDER_CARD, width: 1.0 },
+                    shadow: Shadow::default(),
+                    text_color: None,
+                    snap: false,
+                })
+                .into()
+            }
             AppScreen::Player => {
                 let name = self
                     .selected_video_path
@@ -1362,6 +1518,7 @@ impl OtipApp {
         let content = match self.screen {
             AppScreen::Splash => self.view_splash(),
             AppScreen::Library => self.view_library(),
+            AppScreen::SafeScan => self.view_safe_scan(),
             AppScreen::Player => self.view_player(),
         };
         let title_bar = self.view_title_bar();
@@ -1558,6 +1715,307 @@ impl OtipApp {
             .center_y(Length::Fill)
             .style(|_: &Theme| container::Style {
                 background: Some(Background::Color(palette::SCRIM)),
+                border: Border::default(),
+                shadow: Shadow::default(),
+                text_color: None,
+                snap: false,
+            })
+            .into()
+    }
+
+    /// Safe Mode gate screen: AI status/settings are shown FIRST, and
+    /// playback only begins once the scan reports completion
+    /// (Message::AiScanComplete -> Player hand-off).
+    fn view_safe_scan(&self) -> Element<'_, Message> {
+        let video_name = self
+            .selected_video_path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or("Selected Video")
+            .to_string();
+
+        // ── Header ──
+        let header = column![
+            row![
+                text("◉").size(22).color(palette::SAFE_GREEN),
+                column![
+                    text("Safe Mode — AI Checks First").size(20).color(palette::TEXT_MAIN),
+                    text("The AI analyzes every scene before playback starts, keeping you 100% protected.")
+                        .size(12)
+                        .color(palette::TEXT_DIM),
+                ]
+                .spacing(2),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center),
+            Space::new().height(Length::Fixed(8.0)),
+            container(text(format!("Media: {}", video_name)).size(13).color(palette::ACCENT))
+                .padding([6, 12])
+                .style(|_: &Theme| container::Style {
+                    background: Some(Background::Color(palette::BG_ELEVATED)),
+                    border: Border { radius: 8.0.into(), color: palette::BORDER_CARD, width: 1.0 },
+                    shadow: Shadow::default(),
+                    text_color: None,
+                    snap: false,
+                }),
+        ]
+        .spacing(6);
+
+        // ── Live scan status block (progress bar + phase label) ──
+        let scanning = self.scan_progress.is_some();
+        let status_block: Element<'_, Message> = if let Some(p) = self.scan_progress {
+            column![
+                row![
+                    text("◌").size(20).color(palette::AI_PURPLE),
+                    text("AI is working — analyzing the video…").size(14).color(palette::TEXT_MAIN),
+                    Space::new().width(Length::Fill),
+                    text(self.scan_status.clone()).size(11).color(palette::TEXT_DIM),
+                    text(format!("{}%", (p * 100.0).round() as u32))
+                        .size(18)
+                        .color(palette::AI_PURPLE),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+                Space::new().height(Length::Fixed(6.0)),
+                progress_bar(0.0..=1.0, p)
+                    .length(Length::Fill)
+                    .girth(Length::Fixed(10.0)),
+                Space::new().height(Length::Fixed(4.0)),
+                text("Playback will start automatically when the scan completes.")
+                    .size(11)
+                    .color(palette::SAFE_GREEN),
+            ]
+            .spacing(4)
+            .into()
+        } else {
+            column![
+                container(
+                    text("AI scan not started yet — configure below and press Start.")
+                        .size(13)
+                        .color(palette::TEXT_DIM)
+                )
+                .padding([10, 12])
+                .style(|_: &Theme| container::Style {
+                    background: Some(Background::Color(palette::BG_ELEVATED)),
+                    border: Border { radius: 8.0.into(), color: palette::WARN, width: 1.0 },
+                    shadow: Shadow::default(),
+                    text_color: None,
+                    snap: false,
+                }),
+            ]
+            .spacing(4)
+            .into()
+        };
+
+        // ── AI settings (shown first, exactly as requested) ──
+        let key_ready = !self.gemini_api_key.trim().is_empty();
+        let gemini_settings = column![
+            text("AI Settings").size(14).color(palette::TEXT_MAIN),
+            row![
+                text("●").size(9).color(if key_ready { palette::SAFE_GREEN } else { palette::WARN }),
+                text(if key_ready { "Gemini Ready" } else { "API Key Required" })
+                    .size(10)
+                    .color(palette::TEXT_DIM),
+                text("·")
+                    .size(10)
+                    .color(palette::TEXT_DIM),
+                container(text("aistudio.google.com").size(10).color(palette::ACCENT))
+                    .padding([2, 6])
+                    .style(|_: &Theme| container::Style {
+                        background: Some(Background::Color(palette::ACCENT_DIM)),
+                        border: Border { radius: 6.0.into(), ..Default::default() },
+                        shadow: Shadow::default(),
+                        text_color: None,
+                        snap: false,
+                    }),
+            ]
+            .spacing(5)
+            .align_y(Alignment::Center),
+            row![
+                text("Gemini API Key").size(12).color(palette::TEXT_DIM),
+                text_input("AIzaSy... (free key from AI Studio)", &self.gemini_api_key)
+                    .on_input(Message::GeminiApiKeyChanged)
+                    .padding(9)
+                    .width(Length::Fill)
+                    .style(|_: &Theme, _| iced::widget::text_input::Style {
+                        background: Background::Color(palette::BG_ELEVATED),
+                        border: Border {
+                            color: palette::BORDER_CARD,
+                            width: 1.0,
+                            radius: 8.0.into(),
+                        },
+                        placeholder: palette::TEXT_DIM,
+                        value: palette::TEXT_MAIN,
+                        selection: palette::ACCENT_SOFT,
+                        icon: palette::TEXT_DIM,
+                    }),
+            ]
+            .align_y(Alignment::Center)
+            .spacing(10),
+            row![
+                text("Vision Model").size(12).color(palette::TEXT_DIM),
+                pick_list(
+                    &GEMINI_MODELS[..],
+                    Some(self.gemini_model.as_str()),
+                    |s: &str| Message::GeminiModelSelected(s.to_string()),
+                )
+                .placeholder("gemini-3.8-flash")
+                .width(Length::Fixed(220.0))
+                .style(dark_pick_list_style()),
+                text("9 frames stitched into a 3x3 grid per request — fewer calls")
+                    .size(11)
+                    .color(palette::TEXT_DIM),
+            ]
+            .align_y(Alignment::Center)
+            .spacing(10),
+            row![
+                text("Skip Prompt").size(12).color(palette::TEXT_DIM),
+                text_input(
+                    "Detect explicit adult nudity, extreme violence, gore, or sponsor segments...",
+                    &self.ai_skip_prompt,
+                )
+                .on_input(Message::AiPromptChanged)
+                .padding(9)
+                .width(Length::Fill)
+                .style(|_: &Theme, _| iced::widget::text_input::Style {
+                    background: Background::Color(palette::BG_ELEVATED),
+                    border: Border {
+                        color: palette::BORDER_CARD,
+                        width: 1.0,
+                        radius: 8.0.into(),
+                    },
+                    placeholder: palette::TEXT_DIM,
+                    value: palette::TEXT_MAIN,
+                    selection: palette::ACCENT_SOFT,
+                    icon: palette::TEXT_DIM,
+                }),
+            ]
+            .align_y(Alignment::Center)
+            .spacing(10),
+        ]
+        .spacing(12);
+
+        // ── Action buttons ──
+        let start_btn = button(
+            row![
+                text(if scanning { "◌" } else { "◈" }).size(13).color(palette::AI_PURPLE),
+                text(if scanning {
+                    "Scanning in Progress…"
+                } else {
+                    "Start AI Scan"
+                })
+                .size(13)
+                .color(Color::WHITE),
+            ]
+            .spacing(7)
+            .align_y(Alignment::Center),
+        )
+        .on_press_maybe(if scanning {
+            None
+        } else {
+            Some(Message::StartSafeScan)
+        })
+        .padding([12, 22])
+        .style(|_: &Theme, s| button::Style {
+            background: Some(Background::Color(match s {
+                button::Status::Hovered => Color::from_rgb(0.72, 0.40, 1.0),
+                _ => palette::AI_PURPLE,
+            })),
+            border: Border { radius: 10.0.into(), ..Default::default() },
+            text_color: Color::WHITE,
+            shadow: Shadow::default(),
+            snap: false,
+        });
+
+        let cancel_btn = button(text("Cancel — Back to Library").size(12).color(palette::TEXT_DIM))
+            .on_press(Message::CloseSafeScan)
+            .padding([12, 18])
+            .style(|_: &Theme, s| button::Style {
+                background: Some(Background::Color(match s {
+                    button::Status::Hovered => palette::BG_HOVER,
+                    _ => Color::TRANSPARENT,
+                })),
+                border: Border { radius: 10.0.into(), color: palette::BORDER_CARD, width: 1.0 },
+                text_color: palette::TEXT_DIM,
+                shadow: Shadow::default(),
+                snap: false,
+            });
+
+        let skip_guard_btn = button(
+            row![
+                text("⚠").size(12),
+                text("Play Now (No Scan)").size(12),
+            ]
+            .spacing(5)
+            .align_y(Alignment::Center),
+        )
+        .on_press_maybe(self
+            .selected_video_path
+            .clone()
+            .map(|p| Message::SelectVideoWithMode(p, PlaybackMode::InstantPlay)))
+        .padding([12, 18])
+        .style(|_: &Theme, s| button::Style {
+            background: Some(Background::Color(match s {
+                button::Status::Hovered => palette::BG_HOVER,
+                _ => Color::TRANSPARENT,
+            })),
+            border: Border { radius: 10.0.into(), color: palette::WARN, width: 1.0 },
+            text_color: palette::WARN,
+            shadow: Shadow::default(),
+            snap: false,
+        });
+
+        let status_line = row![
+            text("●").size(9).color(if self.status_is_error { palette::ALERT } else { palette::ACCENT }),
+            text(&self.status).size(11).color(if self.status_is_error { palette::ALERT } else { palette::TEXT_DIM }),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center);
+
+        // ── Card layout ──
+        let card = container(
+            column![
+                header,
+                Space::new().height(Length::Fixed(14.0)),
+                status_block,
+                Space::new().height(Length::Fixed(14.0)),
+                gemini_settings,
+                Space::new().height(Length::Fixed(16.0)),
+                status_line,
+                Space::new().height(Length::Fixed(10.0)),
+                row![
+                    cancel_btn,
+                    skip_guard_btn,
+                    Space::new().width(Length::Fill),
+                    start_btn,
+                ]
+                .spacing(10)
+                .align_y(Alignment::Center),
+            ]
+            .spacing(6),
+        )
+        .width(Length::Fixed(680.0))
+        .padding(24)
+        .style(|_: &Theme| container::Style {
+            background: Some(Background::Color(palette::BG_ELEVATED)),
+            border: Border {
+                color: palette::SAFE_GREEN,
+                width: 1.0,
+                radius: 16.0.into(),
+            },
+            shadow: Shadow::default(),
+            text_color: Some(palette::TEXT_MAIN),
+            snap: false,
+        });
+
+        container(card)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill)
+            .style(|_: &Theme| container::Style {
+                background: Some(Background::Color(palette::BG_MAIN)),
                 border: Border::default(),
                 shadow: Shadow::default(),
                 text_color: None,
